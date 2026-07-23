@@ -1,0 +1,2920 @@
+# Zxk <lineag896@gmail.com>
+# Xiaomi QCACLD WCN3990 port
+#
+# qcacld fix work & port for clover(wcn3990) since no devices currently use qcacld
+# - updates QDF timers, locks, refcounts, netdev, NAPI, procfs, and cfg80211
+#   interfaces for current kernel APIs;
+# - keeps the vendor Kbuild feature profile and module dependency structure;
+# - ports SMMU/IOMMU handling and guards IPA-only assumptions;
+# - constrains non-64-bit HTT DMA to 32 bits so firmware receives complete
+#   fragment addresses;
+# - fixes size_t trace formatting and related transmit-path compatibility.
+#
+# functions:
+# - qdf_mc_timer_*: dispatch modern timer_list callbacks with QDF context.
+# - hif_snoc_enable_bus/hif_set_dma_coherent_mask: configure SNOC DMA safely.
+# - pld_snoc_* and CDS SMMU helpers: use Linux 6.19 IOMMU APIs.
+# - HDD/cfg80211/NAPI adapters: bridge vendor callbacks to current interfaces.
+#diff --git a/drivers/staging/qca-wifi-host-cmn/dp/wifi3.0/dp_internal.h b/drivers/staging/qca-wifi-host-cmn/dp/wifi3.0/dp_internal.h
+index 2aacb15a0790587e1d6517e0194a59f7370e5cda..ed648d7df2b3dd98528acbce97a514822aa178d8 100644
+--- a/drivers/staging/qca-wifi-host-cmn/dp/wifi3.0/dp_internal.h
++++ b/drivers/staging/qca-wifi-host-cmn/dp/wifi3.0/dp_internal.h
+@@ -27,7 +27,7 @@
+ #define VHT_SGI_NYSM 3
+ 
+ #if DP_PRINT_ENABLE
+-#include <stdarg.h>       /* va_list */
++#include <linux/stdarg.h> /* va_list */
+ #include <qdf_types.h> /* qdf_vprint */
+ #include <cdp_txrx_handle.h>
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/inc/hif.h b/drivers/staging/qca-wifi-host-cmn/hif/inc/hif.h
+index f561c54122e90c3799e3a27f1836f3e792897acd..18b009e385fb43d6e2a08fbe7a20356bab7e79a0 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/inc/hif.h
++++ b/drivers/staging/qca-wifi-host-cmn/hif/inc/hif.h
+@@ -174,7 +174,7 @@ struct qca_napi_stat {
+  * instances.
+  */
+ struct qca_napi_info {
+-	struct net_device    netdev; /* dummy net_dev */
++	struct net_device    *netdev; /* dummy net_dev */
+ 	void                 *hif_ctx;
+ 	struct napi_struct   napi;
+ 	uint8_t              scale;   /* currently same on all instances */
+@@ -187,7 +187,7 @@ struct qca_napi_info {
+ 	/* will only be present for data rx CE's */
+ 	void (*offld_flush_cb)(void *);
+ 	struct napi_struct   rx_thread_napi;
+-	struct net_device    rx_thread_netdev;
++	struct net_device    *rx_thread_netdev;
+ #endif /* RECEIVE_OFFLOAD */
+ 	qdf_lro_ctx_t        lro_ctx;
+ };
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/ath_procfs.c b/drivers/staging/qca-wifi-host-cmn/hif/src/ath_procfs.c
+index 3c1cfad94c369fe96e04cb9057c8ab2317adfadf..80f79d5116837a1fc0c271a19ff0a34a79a39d26 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/ath_procfs.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/ath_procfs.c
+@@ -51,7 +51,7 @@ static void *get_hif_hdl_from_file(struct file *file)
+ {
+ 	struct hif_opaque_softc *scn;
+ 
+-	scn = (struct hif_opaque_softc *)PDE_DATA(file_inode(file));
++	scn = (struct hif_opaque_softc *)pde_data(file_inode(file));
+ 	return (void *)scn;
+ }
+ 
+@@ -187,9 +187,9 @@ static ssize_t ath_procfs_diag_write(struct file *file,
+ 		return -EIO;
+ }
+ 
+-static const struct file_operations athdiag_fops = {
+-	.read = ath_procfs_diag_read,
+-	.write = ath_procfs_diag_write,
++static const struct proc_ops athdiag_proc_ops = {
++	.proc_read = ath_procfs_diag_read,
++	.proc_write = ath_procfs_diag_write,
+ };
+ 
+ /*
+@@ -207,7 +207,7 @@ int athdiag_procfs_init(void *scn)
+ 	}
+ 
+ 	proc_file = proc_create_data(PROCFS_NAME, 0600, proc_dir,
+-				     &athdiag_fops, (void *)scn);
++				     &athdiag_proc_ops, (void *)scn);
+ 	if (proc_file == NULL) {
+ 		remove_proc_entry(PROCFS_NAME, proc_dir);
+ 		HIF_ERROR("%s: Could not initialize /proc/%s",
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.c b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.c
+index f702e1808b593b8dc8531aa76781ccc3b726ef19..5d926d32659ec6da42b560425e4dfd8118f026bf 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.c
+@@ -197,9 +197,14 @@ static struct hif_exec_context *hif_exec_napi_create(uint32_t scale)
+ 	ctx->exec_ctx.sched_ops = &napi_sched_ops;
+ 	ctx->exec_ctx.inited = true;
+ 	ctx->exec_ctx.scale_bin_shift = scale;
+-	init_dummy_netdev(&(ctx->netdev));
+-	netif_napi_add(&(ctx->netdev), &(ctx->napi), hif_exec_poll,
+-		       QCA_NAPI_BUDGET);
++	ctx->netdev = alloc_netdev_dummy(0);
++	if (!ctx->netdev) {
++		qdf_mem_free(ctx);
++		return NULL;
++	}
++
++	netif_napi_add_weight(ctx->netdev, &(ctx->napi), hif_exec_poll,
++			      QCA_NAPI_BUDGET);
+ 	napi_enable(&ctx->napi);
+ 
+ 	return &ctx->exec_ctx;
+@@ -441,6 +446,9 @@ struct hif_exec_context *hif_exec_create(enum hif_exec_type type,
+  */
+ void hif_exec_destroy(struct hif_exec_context *ctx)
+ {
++	if (ctx->sched_ops == &napi_sched_ops)
++		free_netdev(hif_exec_get_napi(ctx)->netdev);
++
+ 	qdf_spinlock_destroy(&ctx->irq_lock);
+ 	qdf_mem_free(ctx);
+ }
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.h b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.h
+index ceec48fbfcf7a5245f932d787bcc4b58730acbf4..73ef983e360ab75785b2644faad2f54c9d8a9130 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.h
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.h
+@@ -93,7 +93,7 @@ struct hif_tasklet_exec_context {
+  */
+ struct hif_napi_exec_context {
+ 	struct hif_exec_context exec_ctx;
+-	struct net_device    netdev; /* dummy net_dev */
++	struct net_device    *netdev; /* dummy net_dev */
+ 	struct napi_struct   napi;
+ };
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_napi.c b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_napi.c
+index c7e5c9626c391f0e2bdf427d34461f73712af331..505120ceedd958fa656e7c97bb59fb13f11c7b90 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_napi.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_napi.c
+@@ -73,14 +73,20 @@ static int hif_rxthread_napi_poll(struct napi_struct *napi, int budget)
+  * hif_init_rx_thread_napi() - Initialize dummy Rx_thread NAPI
+  * @napii: Handle to napi_info holding rx_thread napi
+  *
+- * Return: None
++ * Return: 0 on success, negative errno on failure
+  */
+-static void hif_init_rx_thread_napi(struct qca_napi_info *napii)
++static int hif_init_rx_thread_napi(struct qca_napi_info *napii)
+ {
+-	init_dummy_netdev(&napii->rx_thread_netdev);
+-	netif_napi_add(&napii->rx_thread_netdev, &napii->rx_thread_napi,
+-		       hif_rxthread_napi_poll, 64);
++	napii->rx_thread_netdev = alloc_netdev_dummy(0);
++	if (!napii->rx_thread_netdev)
++		return -ENOMEM;
++
++	netif_napi_add_weight(napii->rx_thread_netdev,
++			      &napii->rx_thread_napi,
++			      hif_rxthread_napi_poll, 64);
+ 	napi_enable(&napii->rx_thread_napi);
++
++	return 0;
+ }
+ 
+ /**
+@@ -92,10 +98,13 @@ static void hif_init_rx_thread_napi(struct qca_napi_info *napii)
+ static void hif_deinit_rx_thread_napi(struct qca_napi_info *napii)
+ {
+ 	netif_napi_del(&napii->rx_thread_napi);
++	free_netdev(napii->rx_thread_netdev);
++	napii->rx_thread_netdev = NULL;
+ }
+ #else /* RECEIVE_OFFLOAD */
+-static void hif_init_rx_thread_napi(struct qca_napi_info *napii)
++static int hif_init_rx_thread_napi(struct qca_napi_info *napii)
+ {
++	return 0;
+ }
+ 
+ static void hif_deinit_rx_thread_napi(struct qca_napi_info *napii)
+@@ -201,23 +210,30 @@ int hif_napi_create(struct hif_opaque_softc   *hif_ctx,
+ 			HIF_WARN("%s: bad IRQ value for CE %d: %d",
+ 				 __func__, i, napii->irq);
+ 
+-		init_dummy_netdev(&(napii->netdev));
++		napii->netdev = alloc_netdev_dummy(0);
++		if (!napii->netdev) {
++			rc = -ENOMEM;
++			goto napii_init_failure;
++		}
+ 
+ 		NAPI_DEBUG("adding napi=%pK to netdev=%pK (poll=%pK, bdgt=%d)",
+-			   &(napii->napi), &(napii->netdev), poll, budget);
+-		netif_napi_add(&(napii->netdev), &(napii->napi), poll, budget);
++			   &(napii->napi), napii->netdev, poll, budget);
++		netif_napi_add_weight(napii->netdev, &(napii->napi), poll,
++				      budget);
+ 
+ 		NAPI_DEBUG("after napi_add");
+ 		NAPI_DEBUG("napi=0x%pK, netdev=0x%pK",
+-			   &(napii->napi), &(napii->netdev));
++			   &(napii->napi), napii->netdev);
+ 		NAPI_DEBUG("napi.dev_list.prev=0x%pK, next=0x%pK",
+ 			   napii->napi.dev_list.prev,
+ 			   napii->napi.dev_list.next);
+ 		NAPI_DEBUG("dev.napi_list.prev=0x%pK, next=0x%pK",
+-			   napii->netdev.napi_list.prev,
+-			   napii->netdev.napi_list.next);
++			   napii->netdev->napi_list.prev,
++			   napii->netdev->napi_list.next);
+ 
+-		hif_init_rx_thread_napi(napii);
++		rc = hif_init_rx_thread_napi(napii);
++		if (rc)
++			goto napii_init_failure;
+ 		napii->lro_ctx = qdf_lro_init();
+ 		NAPI_DEBUG("Registering LRO for ce_id %d NAPI callback for %d lro_ctx %pK\n",
+ 				i, napii->id, napii->lro_ctx);
+@@ -240,6 +256,29 @@ int hif_napi_create(struct hif_opaque_softc   *hif_ctx,
+ 	NAPI_DEBUG("NAPI ids created for all applicable pipes");
+ 	return napid->ce_map;
+ 
++napii_init_failure:
++	for (i = 0; i < hif->ce_count; i++) {
++		napii = napid->napis[i];
++		if (!napii)
++			continue;
++
++		if (napii->netdev) {
++			if (napii->lro_ctx)
++				qdf_lro_deinit(napii->lro_ctx);
++			netif_napi_del(&napii->napi);
++#ifdef RECEIVE_OFFLOAD
++			if (napii->rx_thread_netdev)
++				hif_deinit_rx_thread_napi(napii);
++#endif
++			free_netdev(napii->netdev);
++		}
++		napid->napis[i] = NULL;
++		qdf_mem_free(napii);
++	}
++
++	napid->ce_map = 0;
++	goto hnc_err;
++
+ napii_alloc_failure:
+ 	for (i = 0; i < hif->ce_count; i++) {
+ 		napii = napid->napis[i];
+@@ -382,12 +421,13 @@ int hif_napi_destroy(struct hif_opaque_softc *hif_ctx,
+ 				  napii->napi.dev_list.prev,
+ 				  napii->napi.dev_list.next);
+ 			NAPI_DEBUG("dev.napi_l.prv=0x%pK, next=0x%pK",
+-				   napii->netdev.napi_list.prev,
+-				   napii->netdev.napi_list.next);
++				   napii->netdev->napi_list.prev,
++				   napii->netdev->napi_list.next);
+ 
+ 			qdf_lro_deinit(napii->lro_ctx);
+ 			netif_napi_del(&(napii->napi));
+ 			hif_deinit_rx_thread_napi(napii);
++			free_netdev(napii->netdev);
+ 
+ 			napid->ce_map &= ~(0x01 << ce);
+ 			napid->napis[ce] = NULL;
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/snoc/if_snoc.c b/drivers/staging/qca-wifi-host-cmn/hif/src/snoc/if_snoc.c
+index bbdaa7a99525905706ec49bf4e91306a884d474c..c3d2cc8b4f635b9a9cf6fec39a9fd67f53d7b75b 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/snoc/if_snoc.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/snoc/if_snoc.c
+@@ -246,7 +246,12 @@ static int hif_set_dma_coherent_mask(qdf_device_t osdev)
+ #else
+ static int hif_set_dma_coherent_mask(qdf_device_t osdev)
+ {
++#ifdef CONFIG_64BIT_PADDR
+ 	return qdf_set_dma_coherent_mask(osdev->dev, 37);
++#else
++	/* HTT fragment descriptors omit the upper address bits in this build. */
++	return qdf_set_dma_coherent_mask(osdev->dev, 32);
++#endif
+ }
+ #endif
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/os_if/linux/tdls/src/wlan_cfg80211_tdls.c b/drivers/staging/qca-wifi-host-cmn/os_if/linux/tdls/src/wlan_cfg80211_tdls.c
+index 161ba2c508a6df0135b344ad5f7e3d72aaaa1241..a85e915cf94ac188ed888bdbbbb3fb3281ad7d1c 100644
+--- a/drivers/staging/qca-wifi-host-cmn/os_if/linux/tdls/src/wlan_cfg80211_tdls.c
++++ b/drivers/staging/qca-wifi-host-cmn/os_if/linux/tdls/src/wlan_cfg80211_tdls.c
+@@ -345,6 +345,7 @@ wlan_cfg80211_tdls_extract_params(struct tdls_update_peer_params *req_info,
+ 				  struct station_parameters *params)
+ {
+ 	int i;
++	const struct link_station_parameters *link = &params->link_sta_params;
+ 
+ 	cfg80211_debug("sta cap %d, uapsd_queue %d, max_sp %d",
+ 		       params->capability,
+@@ -378,13 +379,13 @@ wlan_cfg80211_tdls_extract_params(struct tdls_update_peer_params *req_info,
+ 		qdf_mem_copy(req_info->extn_capability, params->ext_capab,
+ 			     sizeof(req_info->extn_capability));
+ 
+-	if (params->ht_capa) {
++	if (link->ht_capa) {
+ 		req_info->htcap_present = 1;
+-		qdf_mem_copy(&req_info->ht_cap, params->ht_capa,
++		qdf_mem_copy(&req_info->ht_cap, link->ht_capa,
+ 			     sizeof(struct htcap_cmn_ie));
+ 	}
+ 
+-	req_info->supported_rates_len = params->supported_rates_len;
++	req_info->supported_rates_len = link->supported_rates_len;
+ 
+ 	/* Note : The Maximum sizeof supported_rates sent by the Supplicant is
+ 	 * 32. The supported_rates array , for all the structures propogating
+@@ -399,7 +400,7 @@ wlan_cfg80211_tdls_extract_params(struct tdls_update_peer_params *req_info,
+ 
+ 	if (req_info->supported_rates_len) {
+ 		qdf_mem_copy(req_info->supported_rates,
+-			     params->supported_rates,
++			     link->supported_rates,
+ 			     req_info->supported_rates_len);
+ 		cfg80211_debug("Supported Rates with Length %d",
+ 			       req_info->supported_rates_len);
+@@ -409,13 +410,13 @@ wlan_cfg80211_tdls_extract_params(struct tdls_update_peer_params *req_info,
+ 				       req_info->supported_rates[i]);
+ 	}
+ 
+-	if (params->vht_capa) {
++	if (link->vht_capa) {
+ 		req_info->vhtcap_present = 1;
+-		qdf_mem_copy(&req_info->vht_cap, params->vht_capa,
++		qdf_mem_copy(&req_info->vht_cap, link->vht_capa,
+ 			     sizeof(struct vhtcap));
+ 	}
+ 
+-	if (params->ht_capa || params->vht_capa ||
++	if (link->ht_capa || link->vht_capa ||
+ 	    (params->sta_flags_set & BIT(NL80211_STA_FLAG_WME)))
+ 		req_info->is_qos_wmm_sta = true;
+ }
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/inc/osdep.h b/drivers/staging/qca-wifi-host-cmn/qdf/inc/osdep.h
+index b8456e687b5411107f6b4c4af163ff4e407570d6..83caf0f4f8725a981f074e2e153ded09d3dc7fa7 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/inc/osdep.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/inc/osdep.h
+@@ -70,7 +70,7 @@
+  * fall back to using the immediate work queue.
+  */
+ #define qdf_sysctl_decl(f, ctl, write, filp, buffer, lenp, ppos) \
+-	f(struct ctl_table *ctl, int32_t write, void *buffer, \
++	f(const struct ctl_table *ctl, int write, void *buffer, \
+ 	size_t *lenp, loff_t *ppos)
+ 
+ #define QDF_SYSCTL_PROC_DOINTVEC(ctl, write, filp, buffer, lenp, ppos) \
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_debugfs.h b/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_debugfs.h
+index 99017e1b38aa1375b68dadf49bb4ccaf9cb747c0..2fcdce58afe207bcab5642d37121da46dc51ddc0 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_debugfs.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_debugfs.h
+@@ -133,11 +133,11 @@ void qdf_debugfs_write(qdf_debugfs_file_t file, const uint8_t *buf,
+  * @parent: parent node. If NULL, defaults to base 'qdf_debugfs_root'
+  * @value: pointer to a u8 variable (global/static)
+  *
+- * Return: dentry for the file; NULL in case of failure.
++ * Return: none
+  *
+  */
+-qdf_dentry_t qdf_debugfs_create_u8(const char *name, uint16_t mode,
+-				   qdf_dentry_t parent, u8 *value);
++void qdf_debugfs_create_u8(const char *name, uint16_t mode,
++			   qdf_dentry_t parent, u8 *value);
+ 
+ /**
+  * qdf_debugfs_create_u16() - create a debugfs file for a u16 variable
+@@ -146,11 +146,11 @@ qdf_dentry_t qdf_debugfs_create_u8(const char *name, uint16_t mode,
+  * @parent: parent node. If NULL, defaults to base 'qdf_debugfs_root'
+  * @value: pointer to a u16 variable (global/static)
+  *
+- * Return: dentry for the file; NULL in case of failure.
++ * Return: none
+  *
+  */
+-qdf_dentry_t qdf_debugfs_create_u16(const char *name, uint16_t mode,
+-				    qdf_dentry_t parent, u16 *value);
++void qdf_debugfs_create_u16(const char *name, uint16_t mode,
++			    qdf_dentry_t parent, u16 *value);
+ 
+ /**
+  * qdf_debugfs_create_u32() - create a debugfs file for a u32 variable
+@@ -159,11 +159,11 @@ qdf_dentry_t qdf_debugfs_create_u16(const char *name, uint16_t mode,
+  * @parent: parent node. If NULL, defaults to base 'qdf_debugfs_root'
+  * @value: pointer to a u32 variable (global/static)
+  *
+- * Return: dentry for the file; NULL in case of failure.
++ * Return: none
+  *
+  */
+-qdf_dentry_t qdf_debugfs_create_u32(const char *name, uint16_t mode,
+-				    qdf_dentry_t parent, u32 *value);
++void qdf_debugfs_create_u32(const char *name, uint16_t mode,
++			    qdf_dentry_t parent, u32 *value);
+ 
+ /**
+  * qdf_debugfs_create_u64() - create a debugfs file for a u64 variable
+@@ -172,11 +172,11 @@ qdf_dentry_t qdf_debugfs_create_u32(const char *name, uint16_t mode,
+  * @parent: parent node. If NULL, defaults to base 'qdf_debugfs_root'
+  * @value: pointer to a u64 variable (global/static)
+  *
+- * Return: dentry for the file; NULL in case of failure.
++ * Return: none
+  *
+  */
+-qdf_dentry_t qdf_debugfs_create_u64(const char *name, uint16_t mode,
+-				    qdf_dentry_t parent, u64 *value);
++void qdf_debugfs_create_u64(const char *name, uint16_t mode,
++			    qdf_dentry_t parent, u64 *value);
+ 
+ /**
+  * qdf_debugfs_create_atomic() - create a debugfs file for an atomic variable
+@@ -185,12 +185,11 @@ qdf_dentry_t qdf_debugfs_create_u64(const char *name, uint16_t mode,
+  * @parent: parent node. If NULL, defaults to base 'qdf_debugfs_root'
+  * @value: pointer to an atomic variable (global/static)
+  *
+- * Return: dentry for the file; NULL in case of failure.
++ * Return: none
+  *
+  */
+-qdf_dentry_t qdf_debugfs_create_atomic(const char *name, uint16_t mode,
+-				       qdf_dentry_t parent,
+-				       qdf_atomic_t *value);
++void qdf_debugfs_create_atomic(const char *name, uint16_t mode,
++			       qdf_dentry_t parent, qdf_atomic_t *value);
+ 
+ /**
+  * qdf_debugfs_create_string() - create a debugfs file for a string
+@@ -269,43 +268,30 @@ static inline void qdf_debugfs_write(qdf_debugfs_file_t file,
+ {
+ }
+ 
+-static inline qdf_dentry_t qdf_debugfs_create_u8(const char *name,
+-						 uint16_t mode,
+-						 qdf_dentry_t parent, u8 *value)
++static inline void qdf_debugfs_create_u8(const char *name, uint16_t mode,
++					 qdf_dentry_t parent, u8 *value)
+ {
+-	return NULL;
+ }
+ 
+-static inline qdf_dentry_t qdf_debugfs_create_u16(const char *name,
+-						  uint16_t mode,
+-						  qdf_dentry_t parent,
+-						  u16 *value)
++static inline void qdf_debugfs_create_u16(const char *name, uint16_t mode,
++					  qdf_dentry_t parent, u16 *value)
+ {
+-	return NULL;
+ }
+ 
+-static inline qdf_dentry_t qdf_debugfs_create_u32(const char *name,
+-						  uint16_t mode,
+-						  qdf_dentry_t parent,
+-						  u32 *value)
++static inline void qdf_debugfs_create_u32(const char *name, uint16_t mode,
++					  qdf_dentry_t parent, u32 *value)
+ {
+-	return NULL;
+ }
+ 
+-static inline qdf_dentry_t qdf_debugfs_create_u64(const char *name,
+-						  uint16_t mode,
+-						  qdf_dentry_t parent,
+-						  u64 *value)
++static inline void qdf_debugfs_create_u64(const char *name, uint16_t mode,
++					  qdf_dentry_t parent, u64 *value)
+ {
+-	return NULL;
+ }
+ 
+-static inline qdf_dentry_t qdf_debugfs_create_atomic(const char *name,
+-						     uint16_t mode,
+-						     qdf_dentry_t parent,
+-						     qdf_atomic_t *value)
++static inline void qdf_debugfs_create_atomic(const char *name, uint16_t mode,
++					     qdf_dentry_t parent,
++					     qdf_atomic_t *value)
+ {
+-	return NULL;
+ }
+ 
+ static inline qdf_dentry_t debugfs_create_string(const char *name,
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_trace.h b/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_trace.h
+index 03c69da15b39f2bcc2b90bd5f181fdca703327ba..83836b9e364091295fbe331147f164db875bc459 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_trace.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_trace.h
+@@ -27,7 +27,7 @@
+ 
+ /* Include Files */
+ #include  <qdf_types.h>         /* For QDF_MODULE_ID... */
+-#include  <stdarg.h>            /* For va_list... */
++#include  <linux/stdarg.h>      /* For va_list... */
+ #include  <qdf_status.h>
+ #include  <qdf_nbuf.h>
+ #include  <i_qdf_types.h>
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_types.h b/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_types.h
+index a9af1d9d5f958df459041bdd4d2cd1831322ad91..a3496294ebd8bf1e89ffa7c4b6ace5ff2781561f 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_types.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/inc/qdf_types.h
+@@ -33,11 +33,38 @@
+ 
+ /* Include Files */
+ #include <i_qdf_types.h>
+-#include <stdarg.h>
++#include <linux/string.h>
++#include <linux/stdarg.h>
+ #ifdef TSOSEG_DEBUG
+ #include <qdf_atomic.h>
+ #endif
+ 
++/*
++ * strlcpy was removed from the kernel. Preserve the vendor driver's source
++ * length return value as well as its NUL-terminated truncation semantics.
++ */
++static inline size_t qdf_compat_strlcpy(char *dst, const char *src,
++					size_t size)
++{
++	size_t src_len = strlen(src);
++
++	if (size) {
++		size_t copy_len = min(src_len, size - 1);
++
++		memcpy(dst, src, copy_len);
++		dst[copy_len] = '\0';
++	}
++
++	return src_len;
++}
++
++#define strlcpy qdf_compat_strlcpy
++#define __ieee80211_get_channel ieee80211_get_channel
++#define netif_rx_ni netif_rx
++#ifndef WLAN_EID_VHT_TX_POWER_ENVELOPE
++#define WLAN_EID_VHT_TX_POWER_ENVELOPE WLAN_EID_TX_POWER_ENVELOPE
++#endif
++
+ /* Preprocessor definitions and constants */
+ #define QDF_MAX_SGLIST 4
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_defer.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_defer.h
+index 28209f5ca9355a8d0c23f35adb320dd1e89d1f14..b92ff7855294e55da9839ad122198a0f784b8109 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_defer.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_defer.h
+@@ -30,7 +30,11 @@
+ #include <qdf_status.h>
+ #include <qdf_trace.h>
+ 
+-typedef struct tasklet_struct __qdf_bh_t;
++typedef struct {
++	struct tasklet_struct tasklet;
++	qdf_defer_fn_t fn;
++	void *arg;
++} __qdf_bh_t;
+ typedef struct workqueue_struct __qdf_workqueue_t;
+ 
+ /**
+@@ -60,8 +64,6 @@ typedef struct {
+ extern void __qdf_defer_func(struct work_struct *work);
+ extern void __qdf_defer_delayed_func(struct work_struct *work);
+ 
+-typedef void (*__qdf_bh_fn_t)(unsigned long arg);
+-
+ /**
+  * __qdf_init_work - Initialize a work/task queue, This runs in non-interrupt
+  * context, so can be preempted by H/W & S/W intr
+@@ -254,10 +256,19 @@ static inline void __qdf_destroy_workqueue(__qdf_workqueue_t *wqueue)
+  * @arg: argument for the deferred function
+  * Return: none
+  */
++static inline void __qdf_bh_func(struct tasklet_struct *tasklet)
++{
++	__qdf_bh_t *bh = from_tasklet(bh, tasklet, tasklet);
++
++	bh->fn(bh->arg);
++}
++
+ static inline QDF_STATUS
+-__qdf_init_bh(struct tasklet_struct *bh, qdf_defer_fn_t func, void *arg)
++__qdf_init_bh(__qdf_bh_t *bh, qdf_defer_fn_t func, void *arg)
+ {
+-	tasklet_init(bh, (__qdf_bh_fn_t) func, (unsigned long)arg);
++	bh->fn = func;
++	bh->arg = arg;
++	tasklet_setup(&bh->tasklet, __qdf_bh_func);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
+@@ -266,9 +277,9 @@ __qdf_init_bh(struct tasklet_struct *bh, qdf_defer_fn_t func, void *arg)
+  * @bh: pointer to bottom
+  * Return: none
+  */
+-static inline QDF_STATUS __qdf_sched_bh(struct tasklet_struct *bh)
++static inline QDF_STATUS __qdf_sched_bh(__qdf_bh_t *bh)
+ {
+-	tasklet_schedule(bh);
++	tasklet_schedule(&bh->tasklet);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
+@@ -290,9 +301,9 @@ static inline QDF_STATUS __qdf_disable_work(__qdf_work_t *work)
+  * @bh: pointer to bottom
+  * Return: none
+  */
+-static inline QDF_STATUS __qdf_disable_bh(struct tasklet_struct *bh)
++static inline QDF_STATUS __qdf_disable_bh(__qdf_bh_t *bh)
+ {
+-	tasklet_kill(bh);
++	tasklet_kill(&bh->tasklet);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_lock.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_lock.h
+index 0a26bdbd5aa8003dce70b78e3bd6d4d91c8a20b2..28bd5ab3ea3addedee8a1ada5750d32abdb658ee 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_lock.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_lock.h
+@@ -84,7 +84,7 @@ typedef struct __qdf_spinlock {
+ 
+ typedef struct semaphore __qdf_semaphore_t;
+ 
+-typedef struct wakeup_source qdf_wake_lock_t;
++typedef struct wakeup_source *qdf_wake_lock_t;
+ 
+ struct hif_pm_runtime_lock;
+ typedef struct qdf_runtime_lock {
+@@ -255,7 +255,7 @@ static inline int __qdf_spin_is_locked(__qdf_spinlock_t *lock)
+  */
+ static inline int __qdf_spin_trylock_bh(__qdf_spinlock_t *lock)
+ {
+-	if (likely(irqs_disabled() || in_irq() || in_softirq()))
++	if (likely(irqs_disabled() || in_hardirq() || in_softirq()))
+ 		return spin_trylock(&lock->spinlock);
+ 
+ 	if (spin_trylock_bh(&lock->spinlock)) {
+@@ -274,7 +274,7 @@ static inline int __qdf_spin_trylock_bh(__qdf_spinlock_t *lock)
+  */
+ static inline void __qdf_spin_lock_bh(__qdf_spinlock_t *lock)
+ {
+-	if (likely(irqs_disabled() || in_irq() || in_softirq())) {
++	if (likely(irqs_disabled() || in_hardirq() || in_softirq())) {
+ 		spin_lock(&lock->spinlock);
+ 	} else {
+ 		spin_lock_bh(&lock->spinlock);
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_mem.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_mem.h
+index 9799b71599c72af228b5282f3b3f1962683ec0a9..78cf83d0291d3daf331fa2d312778429dbfb702c 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_mem.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_mem.h
+@@ -63,7 +63,6 @@
+ 
+ #ifdef CONFIG_ARM_SMMU
+ #include <pld_common.h>
+-#include <asm/dma-iommu.h>
+ #include <linux/iommu.h>
+ #endif
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h
+index 38bcfa4e4248515971418a875cd471ac5560a12a..ba82e612e8c55e576fc5c82bb562447833e4c4f0 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_nbuf.h
+@@ -278,7 +278,7 @@ struct qdf_nbuf_cb {
+ }; /* struct qdf_nbuf_cb: MAX 48 bytes */
+ 
+ QDF_COMPILE_TIME_ASSERT(qdf_nbuf_cb_size,
+-	(sizeof(struct qdf_nbuf_cb)) <= FIELD_SIZEOF(struct sk_buff, cb));
++	(sizeof(struct qdf_nbuf_cb)) <= sizeof_field(struct sk_buff, cb));
+ 
+ /**
+  *  access macros to qdf_nbuf_cb
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_str.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_str.h
+index 0f54196c36e5261244fbfa8b66f3edbbd1b30a87..f77f211e4c263fe184d4e9679925672841bdbd0e 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_str.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_str.h
+@@ -28,7 +28,13 @@
+ 
+ #define __qdf_is_space(c) isspace(c)
+ #define __qdf_str_cmp(left, right) strcmp(left, right)
+-#define __qdf_str_lcopy(dest, src, dest_size) strlcpy(dest, src, dest_size)
++static inline size_t __qdf_str_lcopy(char *dest, const char *src,
++				     size_t dest_size)
++{
++	ssize_t copied = strscpy(dest, src, dest_size);
++
++	return copied < 0 ? strlen(src) : copied;
++}
+ #define __qdf_str_left_trim(str) skip_spaces(str)
+ #define __qdf_str_len(str) strlen(str)
+ #define __qdf_str_trim(str) strim(str)
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_time.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_time.h
+index 7f0b41e914ceb44089f74cd84c4b3230fc6bc4a9..c46adea5858df1ca851fb5089239e296626d9c20 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_time.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_time.h
+@@ -33,7 +33,7 @@
+ #include <linux/hrtimer.h>
+ #endif
+ #ifdef MSM_PLATFORM
+-#include <asm/arch_timer.h>
++#include <clocksource/arm_arch_timer.h>
+ #endif
+ #ifdef CONFIG_CNSS
+ #include <net/cnss.h>
+@@ -250,11 +250,7 @@ static inline bool __qdf_system_time_after_eq(__qdf_time_t a, __qdf_time_t b)
+  */
+ static inline uint64_t __qdf_get_monotonic_boottime(void)
+ {
+-	struct timespec ts;
+-
+-	get_monotonic_boottime(&ts);
+-
+-	return ((uint64_t) ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
++	return ktime_get_boottime_ns() / NSEC_PER_USEC;
+ }
+ 
+ #if defined (QCA_WIFI_3_0_ADRASTEA) && defined (MSM_PLATFORM)
+@@ -270,12 +266,12 @@ static inline uint64_t __qdf_get_monotonic_boottime(void)
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
+ static inline uint64_t __qdf_get_log_timestamp(void)
+ {
+-	return arch_counter_get_cntvct();
++	return arch_timer_read_counter();
+ }
+ #else
+ static inline uint64_t __qdf_get_log_timestamp(void)
+ {
+-	return arch_counter_get_cntpct();
++	return arch_timer_read_counter();
+ }
+ #endif /* LINUX_VERSION_CODE */
+ #else
+@@ -292,11 +288,7 @@ static inline uint64_t __qdf_get_log_timestamp(void)
+  */
+ static inline uint64_t __qdf_get_log_timestamp(void)
+ {
+-	struct timespec ts;
+-
+-	ktime_get_ts(&ts);
+-
+-	return ((uint64_t) ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
++	return ktime_get_ns() / NSEC_PER_USEC;
+ }
+ #endif /* QCA_WIFI_3_0_ADRASTEA */
+ 
+@@ -314,7 +306,7 @@ static inline uint64_t __qdf_get_log_timestamp(void)
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 17, 0))
+ static inline uint64_t __qdf_get_bootbased_boottime_ns(void)
+ {
+-	return ktime_get_boot_ns();
++	return ktime_get_boottime_ns();
+ }
+ 
+ #else
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h
+index ce1fa8db8a5fe24d85b47124f9c575d0ff259fc3..aff2c871f922c4decc49436ee4bd0389708e7d9e 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/i_qdf_timer.h
+@@ -43,7 +43,8 @@ struct __qdf_timer_t {
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
+ static inline void __os_timer_shim(struct timer_list *os_timer)
+ {
+-	struct __qdf_timer_t *timer = from_timer(timer, os_timer, os_timer);
++	struct __qdf_timer_t *timer =
++		timer_container_of(timer, os_timer, os_timer);
+ 
+ 	timer->callback(timer->context);
+ }
+@@ -127,22 +128,22 @@ static inline void __qdf_timer_mod(struct __qdf_timer_t *timer, uint32_t msec)
+ 
+ static inline bool __qdf_timer_stop(struct __qdf_timer_t *timer)
+ {
+-	return !!del_timer(&timer->os_timer);
++	return !!timer_delete(&timer->os_timer);
+ }
+ 
+ static inline void __qdf_timer_free(struct __qdf_timer_t *timer)
+ {
+ 	struct timer_list *os_timer = &timer->os_timer;
+ 
+-	del_timer_sync(os_timer);
++	timer_delete_sync(os_timer);
+ 
+ 	if (object_is_on_stack(os_timer))
+-		destroy_timer_on_stack(os_timer);
++		timer_destroy_on_stack(os_timer);
+ }
+ 
+ static inline bool __qdf_timer_sync_cancel(struct __qdf_timer_t *timer)
+ {
+-	return del_timer_sync(&timer->os_timer);
++	return timer_delete_sync(&timer->os_timer);
+ }
+ 
+ #endif /* _I_QDF_TIMER_H */
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_crypto.c b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_crypto.c
+index c0e6234342da52654a5c1cf6cf0995eedf56f4e5..f70c881093cab38fb87f01786d7584a835f751e1 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_crypto.c
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_crypto.c
+@@ -124,7 +124,6 @@ int qdf_get_keyed_hash(const char *alg, const uint8_t *key,
+ 	do {
+ 		SHASH_DESC_ON_STACK(desc, tfm);
+ 		desc->tfm = tfm;
+-		desc->flags = crypto_shash_get_flags(tfm);
+ 
+ 		ret = crypto_shash_init(desc);
+ 		if (ret) {
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_debugfs.c b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_debugfs.c
+index 054a1ee12d3f8c902946a3a4c6b17e382e5d4133..90ca33860dc0dc41f57357a61569de5efadce1b7 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_debugfs.c
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_debugfs.c
+@@ -327,83 +327,82 @@ qdf_dentry_t qdf_debugfs_create_file(const char *name, uint16_t mode,
+ }
+ qdf_export_symbol(qdf_debugfs_create_file);
+ 
+-qdf_dentry_t qdf_debugfs_create_u8(const char *name, uint16_t mode,
+-				   qdf_dentry_t parent, u8 *value)
++void qdf_debugfs_create_u8(const char *name, uint16_t mode,
++			   qdf_dentry_t parent, u8 *value)
+ {
+ 	umode_t filemode;
+ 
+ 	if (!name)
+-		return NULL;
++		return;
+ 
+ 	if (!parent)
+ 		parent = qdf_debugfs_get_root();
+ 
+ 	filemode = qdf_debugfs_get_filemode(mode);
+-	return debugfs_create_u8(name, filemode, parent, value);
++	debugfs_create_u8(name, filemode, parent, value);
+ }
+ 
+-qdf_dentry_t qdf_debugfs_create_u16(const char *name, uint16_t mode,
+-				    qdf_dentry_t parent, u16 *value)
++void qdf_debugfs_create_u16(const char *name, uint16_t mode,
++			    qdf_dentry_t parent, u16 *value)
+ {
+ 	umode_t filemode;
+ 
+ 	if (!name)
+-		return NULL;
++		return;
+ 
+ 	if (!parent)
+ 		parent = qdf_debugfs_get_root();
+ 
+ 	filemode = qdf_debugfs_get_filemode(mode);
+-	return debugfs_create_u16(name, filemode, parent, value);
++	debugfs_create_u16(name, filemode, parent, value);
+ }
+ qdf_export_symbol(qdf_debugfs_create_u16);
+ 
+-qdf_dentry_t qdf_debugfs_create_u32(const char *name,
+-				    uint16_t mode,
+-				    qdf_dentry_t parent, u32 *value)
++void qdf_debugfs_create_u32(const char *name, uint16_t mode,
++			    qdf_dentry_t parent, u32 *value)
+ {
+ 	umode_t filemode;
+ 
+ 	if (!name)
+-		return NULL;
++		return;
+ 
+ 	if (!parent)
+ 		parent = qdf_debugfs_get_root();
+ 
+ 	filemode = qdf_debugfs_get_filemode(mode);
+-	return debugfs_create_u32(name, filemode, parent, value);
++	debugfs_create_u32(name, filemode, parent, value);
+ }
+ qdf_export_symbol(qdf_debugfs_create_u32);
+ 
+-qdf_dentry_t qdf_debugfs_create_u64(const char *name, uint16_t mode,
+-				    qdf_dentry_t parent, u64 *value)
++void qdf_debugfs_create_u64(const char *name, uint16_t mode,
++			    qdf_dentry_t parent, u64 *value)
+ {
+ 	umode_t filemode;
+ 
+ 	if (!name)
+-		return NULL;
++		return;
+ 
+ 	if (!parent)
+ 		parent = qdf_debugfs_get_root();
+ 
+ 	filemode = qdf_debugfs_get_filemode(mode);
+-	return debugfs_create_u64(name, filemode, parent, value);
++	debugfs_create_u64(name, filemode, parent, value);
+ }
+ qdf_export_symbol(qdf_debugfs_create_u64);
+ 
+-qdf_dentry_t qdf_debugfs_create_atomic(const char *name, uint16_t mode,
+-				       qdf_dentry_t parent, qdf_atomic_t *value)
++void qdf_debugfs_create_atomic(const char *name, uint16_t mode,
++			       qdf_dentry_t parent, qdf_atomic_t *value)
+ {
+ 	umode_t filemode;
+ 
+ 	if (!name)
+-		return NULL;
++		return;
+ 
+ 	if (!parent)
+ 		parent = qdf_debugfs_get_root();
+ 
+ 	filemode = qdf_debugfs_get_filemode(mode);
+-	return debugfs_create_atomic_t(name, filemode, parent, value);
++	debugfs_create_atomic_t(name, filemode, parent, value);
+ }
+ qdf_export_symbol(qdf_debugfs_create_atomic);
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_lock.c b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_lock.c
+index 90e1fdd38afa169a89be3a1b29699d7e452d3747..2416708420c51d08d381758dbb5b87ef230a7264 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_lock.c
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_lock.c
+@@ -243,8 +243,8 @@ qdf_export_symbol(qdf_mutex_release);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
+ const char *qdf_wake_lock_name(qdf_wake_lock_t *lock)
+ {
+-	if (lock->name)
+-		return lock->name;
++	if (lock && *lock && (*lock)->name)
++		return (*lock)->name;
+ 	return "UNNAMED_WAKELOCK";
+ }
+ #else
+@@ -267,8 +267,11 @@ qdf_export_symbol(qdf_wake_lock_name);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
+ QDF_STATUS qdf_wake_lock_create(qdf_wake_lock_t *lock, const char *name)
+ {
+-	wakeup_source_init(lock, name);
+-	return QDF_STATUS_SUCCESS;
++	if (!lock)
++		return QDF_STATUS_E_INVAL;
++
++	*lock = wakeup_source_register(NULL, name);
++	return *lock ? QDF_STATUS_SUCCESS : QDF_STATUS_E_NOMEM;
+ }
+ #else
+ QDF_STATUS qdf_wake_lock_create(qdf_wake_lock_t *lock, const char *name)
+@@ -293,7 +296,8 @@ QDF_STATUS qdf_wake_lock_acquire(qdf_wake_lock_t *lock, uint32_t reason)
+ 	host_diag_log_wlock(reason, qdf_wake_lock_name(lock),
+ 			    WIFI_POWER_EVENT_DEFAULT_WAKELOCK_TIMEOUT,
+ 			    WIFI_POWER_EVENT_WAKELOCK_TAKEN);
+-	__pm_stay_awake(lock);
++	if (lock && *lock)
++		__pm_stay_awake(*lock);
+ 
+ 	return QDF_STATUS_SUCCESS;
+ }
+@@ -317,7 +321,8 @@ qdf_export_symbol(qdf_wake_lock_acquire);
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+ QDF_STATUS qdf_wake_lock_timeout_acquire(qdf_wake_lock_t *lock, uint32_t msec)
+ {
+-	pm_wakeup_ws_event(lock, msec, true);
++	if (lock && *lock)
++		pm_wakeup_ws_event(*lock, msec, true);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
+@@ -326,7 +331,8 @@ QDF_STATUS qdf_wake_lock_timeout_acquire(qdf_wake_lock_t *lock, uint32_t msec)
+ 	/* Wakelock for Rx is frequent.
+ 	 * It is reported only during active debug
+ 	 */
+-	__pm_wakeup_event(lock, msec);
++	if (lock && *lock)
++		__pm_wakeup_event(*lock, msec);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ #else /* LINUX_VERSION_CODE */
+@@ -352,7 +358,8 @@ QDF_STATUS qdf_wake_lock_release(qdf_wake_lock_t *lock, uint32_t reason)
+ 	host_diag_log_wlock(reason, qdf_wake_lock_name(lock),
+ 			    WIFI_POWER_EVENT_DEFAULT_WAKELOCK_TIMEOUT,
+ 			    WIFI_POWER_EVENT_WAKELOCK_RELEASED);
+-	__pm_relax(lock);
++	if (lock && *lock)
++		__pm_relax(*lock);
+ 
+ 	return QDF_STATUS_SUCCESS;
+ }
+@@ -375,7 +382,10 @@ qdf_export_symbol(qdf_wake_lock_release);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
+ QDF_STATUS qdf_wake_lock_destroy(qdf_wake_lock_t *lock)
+ {
+-	wakeup_source_trash(lock);
++	if (lock && *lock) {
++		wakeup_source_unregister(*lock);
++		*lock = NULL;
++	}
+ 	return QDF_STATUS_SUCCESS;
+ }
+ #else
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
+index 57d542b7e21250ea8fbf2454f2a546023757a7ae..9da2a754e6ae73e5e8506e1b36c939d80cff7cd5 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_mc_timer.c
+@@ -502,7 +502,7 @@ QDF_STATUS qdf_mc_timer_destroy(qdf_mc_timer_t *timer)
+ 
+ 	case QDF_TIMER_STATE_RUNNING:
+ 		/* Stop the timer first */
+-		del_timer(&(timer->platform_info.timer));
++		timer_delete(&(timer->platform_info.timer));
+ 		v_status = QDF_STATUS_SUCCESS;
+ 		break;
+ 	case QDF_TIMER_STATE_STOPPED:
+@@ -589,7 +589,7 @@ QDF_STATUS qdf_mc_timer_destroy(qdf_mc_timer_t *timer)
+ 
+ 	case QDF_TIMER_STATE_RUNNING:
+ 		/* Stop the timer first */
+-		del_timer(&(timer->platform_info.timer));
++		timer_delete(&(timer->platform_info.timer));
+ 		v_status = QDF_STATUS_SUCCESS;
+ 		break;
+ 
+@@ -757,7 +757,7 @@ QDF_STATUS qdf_mc_timer_stop(qdf_mc_timer_t *timer)
+ 
+ 	qdf_spin_unlock_irqrestore(&timer->platform_info.spinlock);
+ 
+-	del_timer(&(timer->platform_info.timer));
++	timer_delete(&(timer->platform_info.timer));
+ 
+ 	qdf_try_allowing_sleep(timer->type);
+ 
+@@ -798,7 +798,7 @@ QDF_STATUS qdf_mc_timer_stop_sync(qdf_mc_timer_t *timer)
+ 	timer->state = QDF_TIMER_STATE_STOPPED;
+ 
+ 	qdf_spin_unlock_irqrestore(&timer->platform_info.spinlock);
+-	del_timer_sync(&(timer->platform_info.timer));
++	timer_delete_sync(&(timer->platform_info.timer));
+ 
+ 	qdf_try_allowing_sleep(timer->type);
+ 
+@@ -834,36 +834,30 @@ qdf_export_symbol(qdf_mc_timer_get_system_ticks);
+  */
+ unsigned long qdf_mc_timer_get_system_time(void)
+ {
+-	struct timeval tv;
+-
+-	do_gettimeofday(&tv);
+-	return tv.tv_sec * 1000 + tv.tv_usec / 1000;
++	return div_u64(ktime_get_real_ns(), NSEC_PER_MSEC);
+ }
+ qdf_export_symbol(qdf_mc_timer_get_system_time);
+ 
+ s64 qdf_get_monotonic_boottime_ns(void)
+ {
+-	struct timespec ts;
+-
+-	get_monotonic_boottime(&ts);
+-
+-	return timespec_to_ns(&ts);
++	return ktime_get_boottime_ns();
+ }
+ qdf_export_symbol(qdf_get_monotonic_boottime_ns);
+ 
+ qdf_time_t qdf_get_time_of_the_day_ms(void)
+ {
+-	struct timeval tv;
++	struct timespec64 ts;
+ 	qdf_time_t local_time;
+ 	struct rtc_time tm;
+ 
+-	do_gettimeofday(&tv);
+-	local_time = (qdf_time_t)(tv.tv_sec - (sys_tz.tz_minuteswest * 60));
+-	rtc_time_to_tm(local_time, &tm);
++	ktime_get_real_ts64(&ts);
++	local_time = (qdf_time_t)(ts.tv_sec -
++					(sys_tz.tz_minuteswest * 60));
++	rtc_time64_to_tm(local_time, &tm);
+ 
+ 	return (tm.tm_hour * 60 * 60 * 1000) +
+ 		(tm.tm_min * 60 * 1000) + (tm.tm_sec * 1000) +
+-		(tv.tv_usec / 1000);
++		(ts.tv_nsec / NSEC_PER_MSEC);
+ }
+ qdf_export_symbol(qdf_get_time_of_the_day_ms);
+ 
+@@ -883,17 +877,18 @@ qdf_export_symbol(qdf_timer_module_deinit);
+ 
+ void qdf_get_time_of_the_day_in_hr_min_sec_usec(char *tbuf, int len)
+ {
+-	struct timeval tv;
++	struct timespec64 ts;
+ 	struct rtc_time tm;
+-	unsigned long local_time;
++	time64_t local_time;
+ 
+ 	/* Format the Log time R#: [hr:min:sec.microsec] */
+-	do_gettimeofday(&tv);
++	ktime_get_real_ts64(&ts);
+ 	/* Convert rtc to local time */
+-	local_time = (u32)(tv.tv_sec - (sys_tz.tz_minuteswest * 60));
+-	rtc_time_to_tm(local_time, &tm);
++	local_time = ts.tv_sec - (sys_tz.tz_minuteswest * 60);
++	rtc_time64_to_tm(local_time, &tm);
+ 	scnprintf(tbuf, len,
+ 		"[%02d:%02d:%02d.%06lu]",
+-		tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_usec);
++		tm.tm_hour, tm.tm_min, tm.tm_sec,
++		ts.tv_nsec / NSEC_PER_USEC);
+ }
+ qdf_export_symbol(qdf_get_time_of_the_day_in_hr_min_sec_usec);
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c
+index ef9bc34474d1c72a9dd8abec7a0acccdbb767b71..4ab671b21d9eee22952ad06d772ea14e5011a73a 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c
+@@ -182,8 +182,6 @@ static inline void qdf_nbuf_tx_desc_count_update(uint8_t packet_type,
+ 		break;
+ 	}
+ }
+-qdf_export_symbol(qdf_nbuf_tx_desc_count_update);
+-
+ /**
+  * qdf_nbuf_tx_desc_count_clear() - Clears packet counter for both data, mgmt
+  *
+@@ -2961,7 +2959,7 @@ uint32_t __qdf_nbuf_get_tso_info(qdf_device_t osdev, struct sk_buff *skb,
+ 	uint32_t num_seg = 0;
+ 	struct qdf_tso_seg_elem_t *curr_seg;
+ 	struct qdf_tso_num_seg_elem_t *total_num_seg;
+-	struct skb_frag_struct *frag = NULL;
++	skb_frag_t *frag = NULL;
+ 	uint32_t tso_frag_len = 0; /* tso segment's fragment length*/
+ 	uint32_t skb_frag_len = 0; /* skb's fragment length (contiguous memory)*/
+ 	uint32_t skb_proc = skb->len; /* bytes of skb pending processing */
+@@ -3232,7 +3230,7 @@ uint32_t __qdf_nbuf_get_tso_num_seg(struct sk_buff *skb)
+ 	uint32_t skb_frag_len = 0;
+ 	uint32_t eit_hdr_len = (skb_transport_header(skb)
+ 			 - skb_mac_header(skb)) + tcp_hdrlen(skb);
+-	struct skb_frag_struct *frag = NULL;
++	skb_frag_t *frag = NULL;
+ 	int j = 0;
+ 	uint32_t temp_num_seg = 0;
+ 
+@@ -3318,7 +3316,7 @@ uint32_t __qdf_nbuf_get_tso_num_seg(struct sk_buff *skb)
+ uint32_t __qdf_nbuf_get_tso_num_seg(struct sk_buff *skb)
+ {
+ 	uint32_t i, gso_size, tmp_len, num_segs = 0;
+-	struct skb_frag_struct *frag = NULL;
++	skb_frag_t *frag = NULL;
+ 
+ 	/*
+ 	 * Check if the head SKB or any of frags are allocated in < 0x50000000
+diff --git a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_threads.c b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_threads.c
+index ad4540cf0f813864faaf1ec5e4a8d4f0b6a50dc3..8814e80c0471fab10a70703b68236a8e752b8162 100644
+--- a/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_threads.c
++++ b/drivers/staging/qca-wifi-host-cmn/qdf/linux/src/qdf_threads.c
+@@ -176,15 +176,11 @@ void qdf_print_thread_trace(qdf_thread_t *thread)
+ 	const int spaces = 4;
+ 	struct task_struct *task = thread;
+ 	unsigned long entries[QDF_PRINT_TRACE_COUNT] = {0};
+-	struct stack_trace trace = {
+-		.nr_entries = 0,
+-		.skip = 0,
+-		.entries = &entries[0],
+-		.max_entries = QDF_PRINT_TRACE_COUNT,
+-	};
+-
+-	save_stack_trace_tsk(task, &trace);
+-	print_stack_trace(&trace, spaces);
++	unsigned int nr_entries;
++
++	nr_entries = stack_trace_save_tsk(task, entries,
++					  QDF_PRINT_TRACE_COUNT, 0);
++	stack_trace_print(entries, nr_entries, spaces);
+ }
+ #else
+ void qdf_print_thread_trace(qdf_thread_t *thread) { }
+diff --git a/drivers/staging/qca-wifi-host-cmn/utils/epping/src/epping_txrx.c b/drivers/staging/qca-wifi-host-cmn/utils/epping/src/epping_txrx.c
+index fd71a433e0b15646bc76a8647f17c20830d01c09..eb33c7eedcf6fac6f90cbf84841ea11b1a8d47c0 100644
+--- a/drivers/staging/qca-wifi-host-cmn/utils/epping/src/epping_txrx.c
++++ b/drivers/staging/qca-wifi-host-cmn/utils/epping/src/epping_txrx.c
+@@ -108,7 +108,8 @@ static void epping_ndev_uninit(struct net_device *dev)
+ 	return;
+ }
+ 
+-static void epping_tx_queue_timeout(struct net_device *dev)
++static void epping_tx_queue_timeout(struct net_device *dev,
++				    unsigned int txqueue)
+ {
+ 	epping_adapter_t *adapter;
+ 
+@@ -120,8 +121,8 @@ static void epping_tx_queue_timeout(struct net_device *dev)
+ 	}
+ 
+ 	EPPING_LOG(QDF_TRACE_LEVEL_ERROR,
+-		   "%s: Transmission timeout occurred, adapter->started= %d",
+-		   __func__, adapter->started);
++		   "%s: Transmission timeout on queue %u, adapter->started= %d",
++		   __func__, txqueue, adapter->started);
+ 
+ 	/* Getting here implies we disabled the TX queues
+ 	 * for too long. Since this is epping
+@@ -214,7 +215,7 @@ static int epping_set_mac_address(struct net_device *dev, void *addr)
+ 	struct sockaddr *psta_mac_addr = addr;
+ 	qdf_mem_copy(&adapter->macAddressCurrent,
+ 		     psta_mac_addr->sa_data, ETH_ALEN);
+-	qdf_mem_copy(dev->dev_addr, psta_mac_addr->sa_data, ETH_ALEN);
++	eth_hw_addr_set(dev, psta_mac_addr->sa_data);
+ 	return 0;
+ }
+ 
+@@ -369,7 +370,7 @@ epping_adapter_t *epping_add_adapter(epping_context_t *pEpping_ctx,
+ 	adapter->dev = dev;
+ 	adapter->pEpping_ctx = pEpping_ctx;
+ 	adapter->device_mode = device_mode;    /* station, SAP, etc */
+-	qdf_mem_copy(dev->dev_addr, (void *)macAddr, sizeof(tSirMacAddr));
++	eth_hw_addr_set(dev, macAddr);
+ 	qdf_mem_copy(adapter->macAddressCurrent.bytes,
+ 		     macAddr, sizeof(tSirMacAddr));
+ 	qdf_spinlock_create(&adapter->data_lock);
+diff --git a/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_logging_sock_svc.c b/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_logging_sock_svc.c
+index 0df84a413d528f11a7ca3099704fcfc4b3bf491b..106aeeb75e554ce4e7c9111ef79a1640bd0aa497 100644
+--- a/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_logging_sock_svc.c
++++ b/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_logging_sock_svc.c
+@@ -196,7 +196,7 @@ static int wlan_queue_logmsg_for_app(void)
+ 
+ static const char *current_process_name(void)
+ {
+-	if (in_irq())
++	if (in_hardirq())
+ 		return "irq";
+ 
+ 	if (in_softirq())
+@@ -755,7 +755,7 @@ static int wlan_logging_thread(void *Arg)
+ 		}
+ 	}
+ 
+-	complete_and_exit(&gwlan_logging.shutdown_comp, 0);
++	kthread_complete_and_exit(&gwlan_logging.shutdown_comp, 0);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_roam_debug.c b/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_roam_debug.c
+index 13bc8f4169a9bc28ef601d34e1f91cd5e002b088..1f758b9083647ff945b9de008f2845d4b62ac87b 100644
+--- a/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_roam_debug.c
++++ b/drivers/staging/qca-wifi-host-cmn/utils/logging/src/wlan_roam_debug.c
+@@ -199,7 +199,4 @@ void wlan_roam_debug_dump_table(void)
+ 			   dbg_rec->arg2);
+ 	} while (i != current_index);
+ }
+-qdf_export_symbol(global_wlan_roam_debug_table);
+-
+-
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/utils/pktlog/linux_ac.c b/drivers/staging/qca-wifi-host-cmn/utils/pktlog/linux_ac.c
+index db50aa9b26f72b1667a059a5093ea01f58cc3317..d98dd67c6dbe49e4052e77e3aedf657738e6ed4f 100644
+--- a/drivers/staging/qca-wifi-host-cmn/utils/pktlog/linux_ac.c
++++ b/drivers/staging/qca-wifi-host-cmn/utils/pktlog/linux_ac.c
+@@ -77,10 +77,10 @@ static int pktlog_release(struct inode *i, struct file *f);
+ static ssize_t pktlog_read(struct file *file, char *buf, size_t nbytes,
+ 			   loff_t *ppos);
+ 
+-static struct file_operations pktlog_fops = {
+-	open:  pktlog_open,
+-	release:pktlog_release,
+-	read : pktlog_read,
++static const struct proc_ops pktlog_proc_ops = {
++	.proc_open = pktlog_open,
++	.proc_release = pktlog_release,
++	.proc_read = pktlog_read,
+ };
+ 
+ void pktlog_disable_adapter_logging(struct hif_opaque_softc *scn)
+@@ -198,6 +198,7 @@ qdf_sysctl_decl(ath_sysctl_pktlog_enable, ctl, write, filp, buffer, lenp, ppos)
+ 	int ret, enable;
+ 	ol_ath_generic_softc_handle scn;
+ 	struct pktlog_dev_t *pl_dev;
++	struct ctl_table table = *ctl;
+ 
+ 	mutex_lock(&proc_mutex);
+ 	scn = (ol_ath_generic_softc_handle) ctl->extra1;
+@@ -218,11 +219,11 @@ qdf_sysctl_decl(ath_sysctl_pktlog_enable, ctl, write, filp, buffer, lenp, ppos)
+ 		return -ENODEV;
+ 	}
+ 
+-	ctl->data = &enable;
+-	ctl->maxlen = sizeof(enable);
++	table.data = &enable;
++	table.maxlen = sizeof(enable);
+ 
+ 	if (write) {
+-		ret = QDF_SYSCTL_PROC_DOINTVEC(ctl, write, filp, buffer,
++		ret = QDF_SYSCTL_PROC_DOINTVEC(&table, write, filp, buffer,
+ 					       lenp, ppos);
+ 		if (ret == 0) {
+ 			ret = pl_dev->pl_funcs->pktlog_enable(
+@@ -234,7 +235,7 @@ qdf_sysctl_decl(ath_sysctl_pktlog_enable, ctl, write, filp, buffer, lenp, ppos)
+ 				  "Line:%d %s:proc_dointvec failed reason %d",
+ 				   __LINE__, __func__, ret);
+ 	} else {
+-		ret = QDF_SYSCTL_PROC_DOINTVEC(ctl, write, filp, buffer,
++		ret = QDF_SYSCTL_PROC_DOINTVEC(&table, write, filp, buffer,
+ 					       lenp, ppos);
+ 		if (ret)
+ 			QDF_TRACE(QDF_MODULE_ID_SYS, QDF_TRACE_LEVEL_DEBUG,
+@@ -242,8 +243,6 @@ qdf_sysctl_decl(ath_sysctl_pktlog_enable, ctl, write, filp, buffer, lenp, ppos)
+ 				   __LINE__, __func__, ret);
+ 	}
+ 
+-	ctl->data = NULL;
+-	ctl->maxlen = 0;
+ 	mutex_unlock(&proc_mutex);
+ 
+ 	return ret;
+@@ -261,6 +260,7 @@ qdf_sysctl_decl(ath_sysctl_pktlog_size, ctl, write, filp, buffer, lenp, ppos)
+ 	int ret, size;
+ 	ol_ath_generic_softc_handle scn;
+ 	struct pktlog_dev_t *pl_dev;
++	struct ctl_table table = *ctl;
+ 
+ 	mutex_lock(&proc_mutex);
+ 	scn = (ol_ath_generic_softc_handle) ctl->extra1;
+@@ -281,23 +281,21 @@ qdf_sysctl_decl(ath_sysctl_pktlog_size, ctl, write, filp, buffer, lenp, ppos)
+ 		return -ENODEV;
+ 	}
+ 
+-	ctl->data = &size;
+-	ctl->maxlen = sizeof(size);
++	table.data = &size;
++	table.maxlen = sizeof(size);
+ 
+ 	if (write) {
+-		ret = QDF_SYSCTL_PROC_DOINTVEC(ctl, write, filp, buffer,
++		ret = QDF_SYSCTL_PROC_DOINTVEC(&table, write, filp, buffer,
+ 					       lenp, ppos);
+ 		if (ret == 0)
+ 			ret = pl_dev->pl_funcs->pktlog_setsize(
+ 					(struct hif_opaque_softc *)scn, size);
+ 	} else {
+ 		size = get_pktlog_bufsize(pl_dev);
+-		ret = QDF_SYSCTL_PROC_DOINTVEC(ctl, write, filp, buffer,
++		ret = QDF_SYSCTL_PROC_DOINTVEC(&table, write, filp, buffer,
+ 					       lenp, ppos);
+ 	}
+ 
+-	ctl->data = NULL;
+-	ctl->maxlen = 0;
+ 	mutex_unlock(&proc_mutex);
+ 
+ 	return ret;
+@@ -309,6 +307,7 @@ static int pktlog_sysctl_register(struct hif_opaque_softc *scn)
+ 	struct pktlog_dev_t *pl_dev = get_pktlog_handle();
+ 	struct ath_pktlog_info_lnx *pl_info_lnx;
+ 	char *proc_name;
++	char *sysctl_path;
+ 
+ 	if (pl_dev) {
+ 		pl_info_lnx = PL_INFO_LNX(pl_dev->pl_info);
+@@ -325,16 +324,6 @@ static int pktlog_sysctl_register(struct hif_opaque_softc *scn)
+ 	 * /proc/sys/PKTLOG_PROC_DIR/<adapter>/size for changing the buffer size
+ 	 */
+ 	memset(pl_info_lnx->sysctls, 0, sizeof(pl_info_lnx->sysctls));
+-	pl_info_lnx->sysctls[0].procname = PKTLOG_PROC_DIR;
+-	pl_info_lnx->sysctls[0].mode = PKTLOG_PROCSYS_DIR_PERM;
+-	pl_info_lnx->sysctls[0].child = &pl_info_lnx->sysctls[2];
+-
+-	/* [1] is NULL terminator */
+-	pl_info_lnx->sysctls[2].procname = proc_name;
+-	pl_info_lnx->sysctls[2].mode = PKTLOG_PROCSYS_DIR_PERM;
+-	pl_info_lnx->sysctls[2].child = &pl_info_lnx->sysctls[4];
+-
+-	/* [3] is NULL terminator */
+ 	pl_info_lnx->sysctls[4].procname = "enable";
+ 	pl_info_lnx->sysctls[4].mode = PKTLOG_PROCSYS_PERM;
+ 	pl_info_lnx->sysctls[4].proc_handler = ath_sysctl_pktlog_enable;
+@@ -391,10 +380,16 @@ static int pktlog_sysctl_register(struct hif_opaque_softc *scn)
+ 		sizeof(pl_info_lnx->info.trigger_interval);
+ 	/* [13] is NULL terminator */
+ 
+-	/* and register everything */
+-	/* register_sysctl_table changed from 2.6.21 onwards */
++	/* register the leaf entries below the explicit pktlog/adapter path */
++	sysctl_path = kasprintf(GFP_KERNEL, "%s/%s", PKTLOG_PROC_DIR,
++				proc_name);
++	if (!sysctl_path)
++		return -ENOMEM;
++
+ 	pl_info_lnx->sysctl_header =
+-		register_sysctl_table(pl_info_lnx->sysctls);
++		register_sysctl_sz(sysctl_path, &pl_info_lnx->sysctls[4],
++				  PKTLOG_SYSCTL_SIZE - 4);
++	kfree(sysctl_path);
+ 
+ 	if (!pl_info_lnx->sysctl_header) {
+ 		printk("%s: failed to register sysctls!\n", proc_name);
+@@ -451,7 +446,7 @@ static int pktlog_attach(struct hif_opaque_softc *scn)
+ 	pl_info_lnx->sysctl_header = NULL;
+ 
+ 	proc_entry = proc_create_data(proc_name, PKTLOG_PROC_PERM,
+-			g_pktlog_pde, &pktlog_fops,
++			g_pktlog_pde, &pktlog_proc_ops,
+ 			&pl_info_lnx->info);
+ 
+ 	if (proc_entry == NULL) {
+@@ -538,7 +533,7 @@ static int __pktlog_open(struct inode *i, struct file *f)
+ 
+ 	PKTLOG_MOD_INC_USE_COUNT;
+ 	pl_info = (struct ath_pktlog_info *)
+-			PDE_DATA(f->f_path.dentry->d_inode);
++			pde_data(file_inode(f));
+ 
+ 	if (!pl_info) {
+ 		pr_err("%s: pl_info NULL", __func__);
+@@ -612,7 +607,7 @@ static int __pktlog_release(struct inode *i, struct file *f)
+ 	PKTLOG_MOD_DEC_USE_COUNT;
+ 
+ 	pl_info = (struct ath_pktlog_info *)
+-			PDE_DATA(f->f_path.dentry->d_inode);
++			pde_data(file_inode(f));
+ 
+ 	if (!pl_info)
+ 		return -EINVAL;
+@@ -845,7 +840,7 @@ __pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
+ 	}
+ 
+ 	pl_info = (struct ath_pktlog_info *)
+-					PDE_DATA(file->f_path.dentry->d_inode);
++					pde_data(file_inode(file));
+ 	if (!pl_info)
+ 		return 0;
+ 
+@@ -992,7 +987,7 @@ pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
+ 	struct ath_pktlog_info *pl_info;
+ 
+ 	pl_info = (struct ath_pktlog_info *)
+-			PDE_DATA(file->f_path.dentry->d_inode);
++			pde_data(file_inode(file));
+ 	if (!pl_info)
+ 		return 0;
+ 
+diff --git a/drivers/staging/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c b/drivers/staging/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
+index e8287102415d45315b83a97e6f4b055fb25d2f0e..07d22f8fe8495d6c94de05a4563503b3c28d305e 100644
+--- a/drivers/staging/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
++++ b/drivers/staging/qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c
+@@ -5700,9 +5700,18 @@ static QDF_STATUS send_setup_install_key_cmd_tlv(wmi_unified_t wmi_handle,
+ 			 sizeof(wmi_key_seq_counter));
+ 	cmd->key_len = key_params->key_len;
+ 
++	/*
++	 * Clover association frontier marker.  This deliberately excludes the key
++	 * bytes, peer address, IV/RSC, and all connection identifiers.
++	 */
++	WMI_LOGI("CLOVER_KEY_TRACE wmi-install-submit vdev=%u key=%u len=%u cipher=%u flags=0x%x",
++		 cmd->vdev_id, cmd->key_ix, cmd->key_len, cmd->key_cipher,
++		 cmd->key_flags);
+ 	wmi_mtrace(WMI_VDEV_INSTALL_KEY_CMDID, cmd->vdev_id, 0);
+ 	status = wmi_unified_cmd_send(wmi_handle, buf, len,
+ 					      WMI_VDEV_INSTALL_KEY_CMDID);
++	WMI_LOGI("CLOVER_KEY_TRACE wmi-install-submit-result vdev=%u status=%u",
++		 cmd->vdev_id, status);
+ 	if (QDF_IS_STATUS_ERROR(status)) {
+ 		qdf_mem_zero(wmi_buf_data(buf), len);
+ 		wmi_buf_free(buf);
+diff --git a/drivers/staging/qcacld-3.0/Kbuild b/drivers/staging/qcacld-3.0/Kbuild
+index ad4e9877d3a045bdd3b7cf70ec4008aa5d309d61..33c83d049de21e49ac846bebba22b9b1dd2bcba2 100644
+--- a/drivers/staging/qcacld-3.0/Kbuild
++++ b/drivers/staging/qcacld-3.0/Kbuild
+@@ -10,7 +10,7 @@ ifeq ($(KERNEL_BUILD), y)
+ 	# These are provided in external module based builds
+ 	# Need to explicitly define for Kernel-based builds
+ 	MODNAME := wlan
+-	WLAN_ROOT := drivers/staging/qcacld-3.0
++	WLAN_ROOT := $(srctree)/drivers/staging/qcacld-3.0
+ 	WLAN_COMMON_ROOT := ../qca-wifi-host-cmn
+ 	WLAN_COMMON_INC := $(WLAN_ROOT)/$(WLAN_COMMON_ROOT)
+ endif
+@@ -18,7 +18,20 @@ endif
+ WLAN_COMMON_ROOT ?= ../qca-wifi-host-cmn
+ WLAN_COMMON_INC ?= $(WLAN_ROOT)/$(WLAN_COMMON_ROOT)
+ 
++# Keep the r48 functional profile as the Clover baseline.  The r49 shipment
++# overlay changed multiple compile-time feature and object-selection gates at
++# once and regressed association before its individual changes could be
++# attributed.  CONFIG_REMOVE_PKT_LOG remains enabled in default_defconfig.
+ CONFIG_QCA_CLD_WLAN_PROFILE ?= default
++
++# The downstream build only tested ICNSS as a built-in ("y").  Our Linux
++# integration deliberately builds ICNSS as a module, but qcacld still needs
++# the same SNOC objects and feature profile.  Normalize the value locally;
++# CONFIG_QCA_CLD_WLAN remains "m", so wlan itself is still a module.
++ifeq ($(CONFIG_ICNSS),m)
++override CONFIG_ICNSS := y
++endif
++
+ ifeq ($(KERNEL_BUILD), n)
+ ifneq ($(ANDROID_BUILD_TOP),)
+       override WLAN_ROOT := $(ANDROID_BUILD_TOP)/$(WLAN_ROOT)
+@@ -1376,7 +1389,7 @@ TARGET_INC :=	-I$(WLAN_ROOT)/../fw-api/hw/qca6290/v2 \
+ 		-I$(WLAN_ROOT)/../fw-api/fw
+ endif
+ 
+-LINUX_INC :=	-Iinclude
++LINUX_INC :=	-I$(srctree)/include
+ 
+ INCS :=		$(HDD_INC) \
+ 		$(EPPING_INC) \
+@@ -1456,9 +1469,9 @@ ifeq ($(CONFIG_REMOVE_PKT_LOG), n)
+ INCS +=		$(PKTLOG_INC)
+ endif
+ 
+-ifeq ($(BUILD_DIAG_VERSION), y)
++# sme_internal.h always includes the host-diag header; with the diagnostic
++# feature disabled that header supplies local no-op stubs and needs no object.
+ INCS +=		$(HOST_DIAG_LOG_INC)
+-endif
+ 
+ INCS +=		$(DISA_INC)
+ INCS +=		$(ACTION_OUI_INC)
+@@ -1573,7 +1586,7 @@ ccflags-y += $(INCS)
+ 
+ cppflags-y +=	-DANI_OS_TYPE_ANDROID=6 \
+ 		-Wall\
+-		-Werror\
++		-Wno-error\
+ 		-D__linux__
+ 
+ cppflags-$(CONFIG_PTT_SOCK_SVC_ENABLE) += -DPTT_SOCK_SVC_ENABLE
+@@ -2055,7 +2068,8 @@ cppflags-$(CONFIG_WLAN_DEBUGFS) += -DWLAN_DEBUGFS
+ 
+ cppflags-$(CONFIG_DYNAMIC_DEBUG) += -DFEATURE_MULTICAST_HOST_FW_MSGS
+ 
+-cppflags-$(CONFIG_ENABLE_SMMU_S1_TRANSLATION) += -DENABLE_SMMU_S1_TRANSLATION
++# SDM660 WCN3990 is behind the ARM SMMU even in this non-Android build.
++cppflags-y += -DENABLE_SMMU_S1_TRANSLATION
+ 
+ #Flag to enable/disable MTRACE feature
+ cppflags-$(CONFIG_ENABLE_MTRACE_LOG) += -DENABLE_MTRACE_LOG
+@@ -2108,7 +2122,7 @@ ifdef CONFIG_TGT_NUM_MSDU_DESC
+ ccflags-y += -DCFG_TGT_NUM_MSDU_DESC=$(CONFIG_TGT_NUM_MSDU_DESC)
+ endif
+ 
+-KBUILD_CPPFLAGS += $(cppflags-y)
++ccflags-y += $(cppflags-y)
+ 
+ # Currently, for versions of gcc which support it, the kernel Makefile
+ # is disabling the maybe-uninitialized warning.  Re-enable it for the
+diff --git a/drivers/staging/qcacld-3.0/configs/default_defconfig b/drivers/staging/qcacld-3.0/configs/default_defconfig
+index ea4b63bbbae8ead920f17225978acd9b922ac368..48f6f3b1b4b738203637f2e01fbac42154ed55ec 100644
+--- a/drivers/staging/qcacld-3.0/configs/default_defconfig
++++ b/drivers/staging/qcacld-3.0/configs/default_defconfig
+@@ -373,7 +373,7 @@ CONFIG_WLAN_LOG_DEBUG := y
+ CONFIG_ATH_PERF_PWR_OFFLOAD := y
+ 
+ #Disable packet log
+-CONFIG_REMOVE_PKT_LOG := n
++CONFIG_REMOVE_PKT_LOG := y
+ 
+ #Enable 11AC TX
+ ifeq ($(CONFIG_ROME_IF),pci)
+diff --git a/drivers/staging/qcacld-3.0/core/cds/inc/cds_crypto.h b/drivers/staging/qcacld-3.0/core/cds/inc/cds_crypto.h
+index 0d507be22bb43bd41dbf3104f601a45de7f836b4..a371ceabb5bbc5ae46c7f8c50cd747b6288cff0b 100644
+--- a/drivers/staging/qcacld-3.0/core/cds/inc/cds_crypto.h
++++ b/drivers/staging/qcacld-3.0/core/cds/inc/cds_crypto.h
+@@ -26,17 +26,89 @@
+  *
+  */
+ 
+-#include <linux/crypto.h>
++#include <crypto/skcipher.h>
++#include <linux/err.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#define crypto_cipher cds_crypto_cipher
++#define crypto_cipher_setkey cds_crypto_cipher_setkey
++#define crypto_cipher_encrypt_one cds_crypto_cipher_encrypt_one
++
++struct cds_crypto_cipher {
++	struct crypto_sync_skcipher *tfm;
++};
+ 
+ static inline struct crypto_cipher *
+ cds_crypto_alloc_cipher(const char *alg_name, u32 type, u32 mask)
+ {
+-	return crypto_alloc_cipher(alg_name, type, mask);
++	struct cds_crypto_cipher *cipher;
++	const char *name = !strcmp(alg_name, "aes") ? "ecb(aes)" : alg_name;
++
++	cipher = kmalloc(sizeof(*cipher), GFP_KERNEL);
++	if (!cipher)
++		return ERR_PTR(-ENOMEM);
++
++	cipher->tfm = crypto_alloc_sync_skcipher(name, type, mask);
++	if (IS_ERR(cipher->tfm)) {
++		int ret = PTR_ERR(cipher->tfm);
++
++		kfree(cipher);
++		return ERR_PTR(ret);
++	}
++
++	return cipher;
++}
++
++static inline int cds_crypto_cipher_setkey(struct crypto_cipher *tfm,
++					   const u8 *key, unsigned int len)
++{
++	return crypto_sync_skcipher_setkey(tfm->tfm, key, len);
++}
++
++static inline void
++cds_crypto_cipher_encrypt_one(struct crypto_cipher *tfm, u8 *dst,
++				      const u8 *src)
++{
++	SYNC_SKCIPHER_REQUEST_ON_STACK(req, tfm->tfm);
++	struct scatterlist sg;
++	unsigned int len = crypto_sync_skcipher_blocksize(tfm->tfm);
++	u8 *block;
++	int ret;
++
++	/*
++	 * skcipher scatterlists require linear-mapped memory.  QCACLD also
++	 * encrypts static module data, which is outside that mapping on arm64.
++	 * Use a linear bounce buffer for both source and destination.
++	 */
++	block = kmemdup(src, len, GFP_ATOMIC);
++	if (!block) {
++		memset(dst, 0, len);
++		return;
++	}
++
++	sg_init_one(&sg, block, len);
++	skcipher_request_set_sync_tfm(req, tfm->tfm);
++	skcipher_request_set_callback(req, 0, NULL, NULL);
++	skcipher_request_set_crypt(req, &sg, &sg, len, NULL);
++	ret = crypto_skcipher_encrypt(req);
++	if (ret)
++		memset(dst, 0, len);
++	else
++		memcpy(dst, block, len);
++	skcipher_request_zero(req);
++	memzero_explicit(block, len);
++	kfree(block);
+ }
+ 
+ static inline void cds_crypto_free_cipher(struct crypto_cipher *tfm)
+ {
+-	crypto_free_cipher(tfm);
++	if (IS_ERR_OR_NULL(tfm))
++		return;
++
++	crypto_free_sync_skcipher(tfm->tfm);
++	kfree(tfm);
+ }
+ 
+ #endif /* if !defined __CDS_CRYPTO_H */
+diff --git a/drivers/staging/qcacld-3.0/core/cds/src/cds_api.c b/drivers/staging/qcacld-3.0/core/cds/src/cds_api.c
+index 93dc3284edc5467294c1d339c084619ca8e4d878..f6d45dbf959557960ddf9b782946b3c93d7ffb4c 100644
+--- a/drivers/staging/qcacld-3.0/core/cds/src/cds_api.c
++++ b/drivers/staging/qcacld-3.0/core/cds/src/cds_api.c
+@@ -62,7 +62,6 @@
+ 
+ #ifdef ENABLE_SMMU_S1_TRANSLATION
+ #include "pld_common.h"
+-#include <asm/dma-iommu.h>
+ #include <linux/iommu.h>
+ #endif
+ /* Preprocessor Definitions and Constants */
+@@ -1915,10 +1914,7 @@ void cds_reset_recovery_reason(void)
+ 
+ uint64_t cds_get_monotonic_boottime(void)
+ {
+-	struct timespec ts;
+-
+-	get_monotonic_boottime(&ts);
+-	return ((uint64_t) ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
++	return ktime_get_boottime_ns() / NSEC_PER_USEC;
+ }
+ 
+ /**
+@@ -2771,19 +2767,15 @@ void cds_incr_arp_stats_tx_tgt_acked(void)
+ QDF_STATUS cds_smmu_mem_map_setup(qdf_device_t osdev, bool ipa_present)
+ {
+ 	struct iommu_domain *domain;
++#ifdef IPA_OFFLOAD
+ 	bool ipa_smmu_enabled;
++#endif
+ 	bool wlan_smmu_enabled;
+ 
+ 	domain = pld_smmu_get_domain(osdev->dev);
+-	if (domain) {
+-		int attr = 0;
+-		int errno = iommu_domain_get_attr(domain,
+-						  DOMAIN_ATTR_S1_BYPASS, &attr);
+-
+-		wlan_smmu_enabled = !errno && !attr;
+-	} else {
++	wlan_smmu_enabled = domain && iommu_is_dma_domain(domain);
++	if (!wlan_smmu_enabled) {
+ 		cds_info("No SMMU mapping present");
+-		wlan_smmu_enabled = false;
+ 	}
+ 
+ 	if (!wlan_smmu_enabled) {
+@@ -2796,6 +2788,7 @@ QDF_STATUS cds_smmu_mem_map_setup(qdf_device_t osdev, bool ipa_present)
+ 		goto exit_with_success;
+ 	}
+ 
++#ifdef IPA_OFFLOAD
+ 	ipa_smmu_enabled = qdf_get_ipa_smmu_enabled();
+ 
+ 	osdev->smmu_s1_enabled = ipa_smmu_enabled && wlan_smmu_enabled;
+@@ -2805,6 +2798,14 @@ QDF_STATUS cds_smmu_mem_map_setup(qdf_device_t osdev, bool ipa_present)
+ 			wlan_smmu_enabled ? "enabled" : "disabled");
+ 		return QDF_STATUS_E_FAILURE;
+ 	}
++#else
++	/*
++	 * ipa_present is false on non-IPA builds, so this branch is only a
++	 * defensive check for a platform/build configuration mismatch.
++	 */
++	cds_err("IPA is present but qcacld was built without IPA offload");
++	return QDF_STATUS_E_FAILURE;
++#endif
+ 
+ exit_with_success:
+ 	osdev->domain = domain;
+diff --git a/drivers/staging/qcacld-3.0/core/cds/src/cds_sched.c b/drivers/staging/qcacld-3.0/core/cds/src/cds_sched.c
+index 62fca2ef8173c9cbda4f53a82d749e017f622511..e111f6c952b4b171894122c9868618cf5a692923 100644
+--- a/drivers/staging/qcacld-3.0/core/cds/src/cds_sched.c
++++ b/drivers/staging/qcacld-3.0/core/cds/src/cds_sched.c
+@@ -727,10 +727,6 @@ static int cds_ol_rx_thread(void *arg)
+ 	int status;
+ 
+ 	set_user_nice(current, -1);
+-#ifdef MSM_PLATFORM
+-	set_wake_up_idle(true);
+-#endif
+-
+ 	complete(&pSchedContext->ol_rx_start_event);
+ 
+ 	while (!shutdown) {
+@@ -779,9 +775,7 @@ static int cds_ol_rx_thread(void *arg)
+ 	}
+ 
+ 	cds_debug("Exiting CDS OL rx thread");
+-	complete_and_exit(&pSchedContext->ol_rx_shutdown, 0);
+-
+-	return 0;
++	kthread_complete_and_exit(&pSchedContext->ol_rx_shutdown, 0);
+ }
+ #endif
+ 
+diff --git a/drivers/staging/qcacld-3.0/core/dp/htt/htt_t2h.c b/drivers/staging/qcacld-3.0/core/dp/htt/htt_t2h.c
+index 8efd042ab991ba15466a84d3e7e708c7591e4fab..179d8da98c19366fab2fd2478b41da0f73db7d58 100644
+--- a/drivers/staging/qcacld-3.0/core/dp/htt/htt_t2h.c
++++ b/drivers/staging/qcacld-3.0/core/dp/htt/htt_t2h.c
+@@ -966,7 +966,7 @@ void htt_t2h_msg_handler(void *context, HTC_PACKET *pkt)
+ 					(QDF_NBUF_CB_PADDR(_buf)),	\
+ 					(skb_end_pointer(_buf) -	\
+ 					(_buf)->data),			\
+-					PCI_DMA_FROMDEVICE);		\
++					DMA_FROM_DEVICE);		\
+ 	} while (0)
+ 
+ /**
+diff --git a/drivers/staging/qcacld-3.0/core/dp/htt/htt_tx.c b/drivers/staging/qcacld-3.0/core/dp/htt/htt_tx.c
+index 28ffb4823a2beecdc6db0d74edc4edaa1c3cafba..1bedc1d1c03c646d57977400728091fc62c4e9dc 100644
+--- a/drivers/staging/qcacld-3.0/core/dp/htt/htt_tx.c
++++ b/drivers/staging/qcacld-3.0/core/dp/htt/htt_tx.c
+@@ -1883,6 +1883,17 @@ htt_tx_desc_init(htt_pdev_handle pdev,
+ 	}
+ 
+ 	qdf_nbuf_data_attr_set(msdu, data_attr);
++	if (QDF_NBUF_CB_GET_PACKET_TYPE(msdu) ==
++	    QDF_NBUF_CB_PACKET_TYPE_EAPOL)
++		QDF_TRACE(QDF_MODULE_ID_TXRX, QDF_TRACE_LEVEL_INFO_HIGH,
++			  "CLOVER_TX_TRACE htt-desc vdev=%u id=%u len=%zu l2=%u tid=%u encrypt=%u desc64=%u data64=%u frags=%u attr=0x%x",
++			  msdu_info->info.vdev_id, msdu_id,
++			  qdf_nbuf_len(msdu), pkt_type,
++			  msdu_info->info.ext_tid,
++			  msdu_info->action.do_encrypt,
++			  !!((u64)htt_tx_desc_paddr >> 32),
++			  !!((u64)QDF_NBUF_CB_PADDR(msdu) >> 32),
++			  qdf_nbuf_get_num_frags(msdu), data_attr);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
+diff --git a/drivers/staging/qcacld-3.0/core/dp/txrx/ol_tx_send.c b/drivers/staging/qcacld-3.0/core/dp/txrx/ol_tx_send.c
+index 46558e14661fda3f7c77519d87d0d4fb65eac7c7..fb2ff252c80638a4b9f7a615f4f105131563be16 100644
+--- a/drivers/staging/qcacld-3.0/core/dp/txrx/ol_tx_send.c
++++ b/drivers/staging/qcacld-3.0/core/dp/txrx/ol_tx_send.c
+@@ -255,6 +255,12 @@ ol_tx_send(struct ol_txrx_pdev_t *pdev,
+ 	msdu_credit_consumed = ol_tx_send_base(pdev, tx_desc, msdu);
+ 	id = ol_tx_desc_id(pdev, tx_desc);
+ 	QDF_NBUF_UPDATE_TX_PKT_COUNT(msdu, QDF_NBUF_TX_PKT_TXRX);
++	if (QDF_NBUF_CB_GET_PACKET_TYPE(msdu) ==
++	    QDF_NBUF_CB_PACKET_TYPE_EAPOL)
++		QDF_TRACE(QDF_MODULE_ID_TXRX, QDF_TRACE_LEVEL_INFO_HIGH,
++			  "CLOVER_TX_TRACE txrx-submit vdev=%u id=%u len=%zu credit=%d",
++			  vdev_id, id, qdf_nbuf_len(msdu),
++			  qdf_atomic_read(&pdev->target_tx_credit));
+ 	DPTRACE(qdf_dp_trace_ptr(msdu, QDF_DP_TRACE_TXRX_PACKET_PTR_RECORD,
+ 				QDF_TRACE_DEFAULT_PDEV_ID,
+ 				qdf_nbuf_data_addr(msdu),
+@@ -321,6 +327,11 @@ ol_tx_download_done_base(struct ol_txrx_pdev_t *pdev,
+ 
+ 	tx_desc = ol_tx_desc_find(pdev, msdu_id);
+ 	qdf_assert(tx_desc);
++	if (QDF_NBUF_CB_GET_PACKET_TYPE(msdu) ==
++	    QDF_NBUF_CB_PACKET_TYPE_EAPOL)
++		QDF_TRACE(QDF_MODULE_ID_TXRX, QDF_TRACE_LEVEL_INFO_HIGH,
++			  "CLOVER_TX_TRACE htc-complete id=%u len=%zu status=%d",
++			  msdu_id, qdf_nbuf_len(msdu), status);
+ 
+ 	/*
+ 	 * If the download is done for
+@@ -900,6 +911,12 @@ ol_tx_completion_handler(ol_txrx_pdev_handle pdev,
+ 		ol_tx_desc_update_comp_ts(tx_desc);
+ 		tx_desc->status = status;
+ 		netbuf = tx_desc->netbuf;
++		if (QDF_NBUF_CB_GET_PACKET_TYPE(netbuf) ==
++		    QDF_NBUF_CB_PACKET_TYPE_EAPOL)
++			QDF_TRACE(QDF_MODULE_ID_TXRX,
++				  QDF_TRACE_LEVEL_INFO_HIGH,
++				  "CLOVER_TX_TRACE firmware-complete id=%u len=%zu status=%u",
++				  tx_desc_id, qdf_nbuf_len(netbuf), status);
+ 
+ 		if (txtstamp64_list) {
+ 			tx_tsf64 =
+diff --git a/drivers/staging/qcacld-3.0/core/dp/txrx/ol_txrx_internal.h b/drivers/staging/qcacld-3.0/core/dp/txrx/ol_txrx_internal.h
+index 04e514a0094c0b65ec9d293ebeb01bb5c39ee1ce..6dd25649285e2439635e5ba2680ea0eaec6b375d 100644
+--- a/drivers/staging/qcacld-3.0/core/dp/txrx/ol_txrx_internal.h
++++ b/drivers/staging/qcacld-3.0/core/dp/txrx/ol_txrx_internal.h
+@@ -67,7 +67,7 @@
+ 
+ #ifdef TXRX_PRINT_ENABLE
+ 
+-#include <stdarg.h>             /* va_list */
++#include <linux/stdarg.h>       /* va_list */
+ #include <qdf_types.h>          /* qdf_vprint */
+ 
+ #define ol_txrx_log(level, args...) \
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_softap_tx_rx.h b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_softap_tx_rx.h
+index 17e0ad5e204d4b27ae4fc75c4d8f52e30eb0efe8..4129dc770a8cf81139dbb274e96def0c052cd697 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_softap_tx_rx.h
++++ b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_softap_tx_rx.h
+@@ -64,7 +64,7 @@ QDF_STATUS hdd_softap_ipa_start_xmit(qdf_nbuf_t nbuf, qdf_netdev_t dev);
+  *
+  * Return: None
+  */
+-void hdd_softap_tx_timeout(struct net_device *dev);
++void hdd_softap_tx_timeout(struct net_device *dev, unsigned int txqueue);
+ 
+ /**
+  * hdd_softap_init_tx_rx() - Initialize Tx/Rx module
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
+index 719c3051c0d4ef2556c48f925afe73378e7b044c..875d3bca6ee1e679acc3c234bea89695459d4395 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
++++ b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_tx_rx.h
+@@ -51,7 +51,7 @@ struct hdd_context;
+ #define SME_QOS_UAPSD_CFG_VO_CHANGED_MASK     0xF8
+ 
+ netdev_tx_t hdd_hard_start_xmit(struct sk_buff *skb, struct net_device *dev);
+-void hdd_tx_timeout(struct net_device *dev);
++void hdd_tx_timeout(struct net_device *dev, unsigned int txqueue);
+ 
+ QDF_STATUS hdd_init_tx_rx(struct hdd_adapter *adapter);
+ QDF_STATUS hdd_deinit_tx_rx(struct hdd_adapter *adapter);
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_wmm.h b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_wmm.h
+index 6a5b0b7b6945277677f36c598f54a6941978cc9c..16383774d382e3f4bdbbb810ac935e9e430f56eb 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_wmm.h
++++ b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_wmm.h
+@@ -251,7 +251,10 @@ QDF_STATUS hdd_wmm_adapter_close(struct hdd_adapter *adapter);
+  *
+  * Return: Qdisc queue index.
+  */
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0))
++uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
++			  struct net_device *sb_dev);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+ uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+ 			  struct net_device *sb_dev,
+ 			  select_queue_fallback_t fallback);
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_assoc.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_assoc.c
+index 0dcc7d5a3d4b4e70ebb5c2cb7945bbeffb4e8460..7b919bb4707d921387e1d43d13f3322c7ce68511 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_assoc.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_assoc.c
+@@ -2204,7 +2204,7 @@ static void hdd_send_roamed_ind(struct net_device *dev,
+ {
+ 	struct cfg80211_roam_info info = {0};
+ 
+-	info.bss = bss;
++	info.links[0].bss = bss;
+ 	info.req_ie = req_ie;
+ 	info.req_ie_len = req_ie_len;
+ 	info.resp_ie = resp_ie;
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+index c39236c3cb95c890e0d4aaee42480ce0c5a44821..697335c1788e196f5bbefc5ef9a246b2fc5ee462 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+@@ -6336,6 +6336,10 @@ int wlan_hdd_send_roam_auth_event(struct hdd_adapter *adapter, uint8_t *bssid,
+ static const struct nla_policy
+ wlan_hdd_wifi_config_policy[QCA_WLAN_VENDOR_ATTR_CONFIG_MAX + 1] = {
+ 
++	[QCA_WLAN_VENDOR_ATTR_CONFIG_SCAN_DEFAULT_IES] = {
++		.type = NLA_BINARY,
++		.len = MAX_DEFAULT_SCAN_IE_LEN,
++	},
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_MODULATED_DTIM] = {.type = NLA_U32 },
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_IGNORE_ASSOC_DISALLOWED] = {
+ 		.type = NLA_U8 },
+@@ -14382,7 +14386,7 @@ int wlan_hdd_send_mode_change_event(void)
+ 	return err;
+ }
+ 
+-const struct wiphy_vendor_command hdd_wiphy_vendor_commands[] = {
++static struct wiphy_vendor_command hdd_wiphy_vendor_commands[] = {
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+ 		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_DFS_CAPABILITY,
+@@ -15706,6 +15710,27 @@ int wlan_hdd_cfg80211_init(struct device *dev,
+ 	wiphy->max_remain_on_channel_duration = MAX_REMAIN_ON_CHANNEL_DURATION;
+ 
+ 	if (cds_get_conparam() != QDF_GLOBAL_FTM_MODE) {
++		/* Legacy handlers validate their own netlink attributes. */
++		for (i = 0; i < ARRAY_SIZE(hdd_wiphy_vendor_commands); i++) {
++			if (hdd_wiphy_vendor_commands[i].policy)
++				continue;
++
++			if (hdd_wiphy_vendor_commands[i].info.subcmd ==
++			    QCA_NL80211_VENDOR_SUBCMD_SET_WIFI_CONFIGURATION) {
++				hdd_wiphy_vendor_commands[i].policy =
++					wlan_hdd_wifi_config_policy;
++				hdd_wiphy_vendor_commands[i].maxattr =
++					QCA_WLAN_VENDOR_ATTR_CONFIG_MAX;
++			} else if (hdd_wiphy_vendor_commands[i].info.subcmd ==
++				   QCA_NL80211_VENDOR_SUBCMD_TRIGGER_SCAN) {
++				hdd_wiphy_vendor_commands[i].policy = scan_policy;
++				hdd_wiphy_vendor_commands[i].maxattr =
++					QCA_WLAN_VENDOR_ATTR_SCAN_MAX;
++			} else {
++				hdd_wiphy_vendor_commands[i].policy =
++					VENDOR_CMD_RAW_DATA;
++			}
++		}
+ 		wiphy->n_vendor_commands =
+ 				ARRAY_SIZE(hdd_wiphy_vendor_commands);
+ 		wiphy->vendor_commands = hdd_wiphy_vendor_commands;
+@@ -16489,15 +16514,18 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
+ 
+ 			if ((QDF_SAP_MODE == adapter->device_mode)
+ 			    && (pConfig->apRandomBssidEnabled)) {
++				uint8_t random_bssid[ETH_ALEN];
++
+ 				/* To meet Android requirements create
+ 				 * a randomized MAC address of the
+ 				 * form 02:1A:11:Fx:xx:xx
+ 				 */
+-				get_random_bytes(&ndev->dev_addr[3], 3);
+-				ndev->dev_addr[0] = 0x02;
+-				ndev->dev_addr[1] = 0x1A;
+-				ndev->dev_addr[2] = 0x11;
+-				ndev->dev_addr[3] |= 0xF0;
++				get_random_bytes(&random_bssid[3], 3);
++				random_bssid[0] = 0x02;
++				random_bssid[1] = 0x1A;
++				random_bssid[2] = 0x11;
++				random_bssid[3] |= 0xF0;
++				eth_hw_addr_set(ndev, random_bssid);
+ 				memcpy(adapter->mac_addr.
+ 				       bytes, ndev->dev_addr,
+ 				       QDF_MAC_ADDR_SIZE);
+@@ -17033,8 +17061,18 @@ static int __wlan_hdd_cfg80211_add_key(struct wiphy *wiphy,
+ 		}
+ 
+ 		/* issue set key request to SME */
++		/*
++		 * Clover association frontier marker.  Do not log key material, peer
++		 * addresses, SSIDs, or sequence counters here: this is only to identify
++		 * whether the r48 EAPOL M2-to-key-install transition reached SME.
++		 */
++		hdd_info("CLOVER_KEY_TRACE hdd-submit vdev=%u pairwise=%u key=%u len=%u cipher=%u dir=%u",
++			 adapter->session_id, pairwise, key_index, params->key_len,
++			 params->cipher, setKey.keyDirection);
+ 		status = sme_roam_set_key(mac_handle,
+ 					  adapter->session_id, &setKey, &roamId);
++		hdd_info("CLOVER_KEY_TRACE hdd-submit-result vdev=%u status=%d",
++			 adapter->session_id, status);
+ 
+ 		if (0 != status) {
+ 			hdd_err("sme_roam_set_key failed, status: %d", status);
+@@ -17535,7 +17573,6 @@ wlan_hdd_inform_bss_frame(struct hdd_adapter *adapter,
+ 	uint32_t freq, i;
+ 	struct cfg80211_bss *bss_status = NULL;
+ 	struct hdd_context *hdd_ctx;
+-	struct timespec ts;
+ 	struct hdd_config *cfg_param;
+ 	struct wlan_cfg80211_inform_bss bss_data = {0};
+ 
+@@ -17575,9 +17612,8 @@ wlan_hdd_inform_bss_frame(struct hdd_adapter *adapter,
+ 	/* Android does not want the timestamp from the frame.
+ 	 * Instead it wants a monotonic increasing value
+ 	 */
+-	get_monotonic_boottime(&ts);
+ 	bss_data.mgmt->u.probe_resp.timestamp =
+-		((u64) ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
++		ktime_get_boottime_ns() / NSEC_PER_USEC;
+ 
+ 	bss_data.mgmt->u.probe_resp.beacon_int = bss_desc->beaconInterval;
+ 	bss_data.mgmt->u.probe_resp.capab_info = bss_desc->capabilityInfo;
+@@ -19968,7 +20004,12 @@ static int __wlan_hdd_cfg80211_connect(struct wiphy *wiphy,
+ 							req->bssid, req->ssid,
+ 							req->ssid_len);
+ 				if (bss) {
+-					cfg80211_assoc_timeout(ndev, bss);
++					struct cfg80211_assoc_failure failure = {
++						.bss = { bss },
++						.timeout = true,
++					};
++
++					cfg80211_assoc_failure(ndev, &failure);
+ 					return -ETIMEDOUT;
+ 				}
+ 			}
+@@ -23098,32 +23139,188 @@ void hdd_set_rate_bw(struct rate_info *info, enum hdd_rate_info_bw hdd_bw)
+  * @key_mgmt_set_pmk = Set pmk key management
+  * @update_connect_params = Update connect params
+  */
++static int
++wlan_hdd_change_beacon_compat(struct wiphy *wiphy, struct net_device *dev,
++			      struct cfg80211_ap_update *info)
++{
++	return wlan_hdd_cfg80211_change_beacon(wiphy, dev, &info->beacon);
++}
++
++static int
++wlan_hdd_stop_ap_compat(struct wiphy *wiphy, struct net_device *dev,
++			unsigned int link_id)
++{
++	if (link_id)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_stop_ap(wiphy, dev);
++}
++
++static bool wlan_hdd_valid_key_link_id(int link_id)
++{
++	return link_id == -1 || link_id == 0;
++}
++
++static int
++wlan_hdd_add_key_compat(struct wiphy *wiphy, struct net_device *dev,
++			int link_id, u8 key_index, bool pairwise,
++			const u8 *mac_addr, struct key_params *params)
++{
++	if (!wlan_hdd_valid_key_link_id(link_id))
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_add_key(wiphy, dev, key_index, pairwise,
++					 mac_addr, params);
++}
++
++static int
++wlan_hdd_get_key_compat(struct wiphy *wiphy, struct net_device *dev,
++			int link_id, u8 key_index, bool pairwise,
++			const u8 *mac_addr, void *cookie,
++			void (*callback)(void *cookie,
++					 struct key_params *params))
++{
++	if (!wlan_hdd_valid_key_link_id(link_id))
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_get_key(wiphy, dev, key_index, pairwise,
++					 mac_addr, cookie, callback);
++}
++
++static int
++wlan_hdd_del_key_compat(struct wiphy *wiphy, struct net_device *dev,
++			int link_id, u8 key_index, bool pairwise,
++			const u8 *mac_addr)
++{
++	if (!wlan_hdd_valid_key_link_id(link_id))
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_del_key(wiphy, dev, key_index, pairwise,
++					 mac_addr);
++}
++
++static int
++wlan_hdd_set_default_key_compat(struct wiphy *wiphy, struct net_device *dev,
++				int link_id, u8 key_index, bool unicast,
++				bool multicast)
++{
++	if (!wlan_hdd_valid_key_link_id(link_id))
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_set_default_key(wiphy, dev, key_index,
++						 unicast, multicast);
++}
++
++static int
++wlan_hdd_set_wiphy_params_compat(struct wiphy *wiphy, int radio_idx,
++				 u32 changed)
++{
++	if (radio_idx)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_set_wiphy_params(wiphy, changed);
++}
++
++static int
++wlan_hdd_set_txpower_compat(struct wiphy *wiphy, struct wireless_dev *wdev,
++			    int radio_idx, enum nl80211_tx_power_setting type,
++			    int dbm)
++{
++	if (radio_idx)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_set_txpower(wiphy, wdev, type, dbm);
++}
++
++static int
++wlan_hdd_get_txpower_compat(struct wiphy *wiphy, struct wireless_dev *wdev,
++			    int radio_idx, unsigned int link_id, int *dbm)
++{
++	if (radio_idx || link_id)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_get_txpower(wiphy, wdev, dbm);
++}
++
++static int
++wlan_hdd_set_default_mgmt_key_compat(struct wiphy *wiphy,
++				     struct net_device *dev, int link_id,
++				     u8 key_index)
++{
++	if (!wlan_hdd_valid_key_link_id(link_id))
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_set_default_mgmt_key(wiphy, dev, key_index);
++}
++
++#ifdef FEATURE_WLAN_TDLS
++static int
++wlan_hdd_tdls_mgmt_compat(struct wiphy *wiphy, struct net_device *dev,
++			  const u8 *peer, int link_id, u8 action_code,
++			  u8 dialog_token, u16 status_code,
++			  u32 peer_capability, bool initiator,
++			  const u8 *buf, size_t len)
++{
++	if (!wlan_hdd_valid_key_link_id(link_id))
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_tdls_mgmt(wiphy, dev, peer, action_code,
++					   dialog_token, status_code,
++					   peer_capability, initiator,
++					   buf, len);
++}
++#endif
++
++#ifdef QCA_HT_2040_COEX
++static int
++wlan_hdd_set_ap_chanwidth_compat(struct wiphy *wiphy, struct net_device *dev,
++				 unsigned int link_id,
++				 struct cfg80211_chan_def *chandef)
++{
++	if (link_id)
++		return -EOPNOTSUPP;
++
++	return wlan_hdd_cfg80211_set_ap_channel_width(wiphy, dev, chandef);
++}
++#endif
++
++#ifdef FEATURE_MONITOR_MODE_SUPPORT
++static int
++wlan_hdd_set_monitor_channel_compat(struct wiphy *wiphy,
++				    struct net_device *dev,
++				    struct cfg80211_chan_def *chandef)
++{
++	(void)dev;
++	return wlan_hdd_cfg80211_set_mon_ch(wiphy, chandef);
++}
++#endif
++
+ static struct cfg80211_ops wlan_hdd_cfg80211_ops = {
+ 	.add_virtual_intf = wlan_hdd_add_virtual_intf,
+ 	.del_virtual_intf = wlan_hdd_del_virtual_intf,
+ 	.change_virtual_intf = wlan_hdd_cfg80211_change_iface,
+ 	.change_station = wlan_hdd_change_station,
+ 	.start_ap = wlan_hdd_cfg80211_start_ap,
+-	.change_beacon = wlan_hdd_cfg80211_change_beacon,
+-	.stop_ap = wlan_hdd_cfg80211_stop_ap,
++	.change_beacon = wlan_hdd_change_beacon_compat,
++	.stop_ap = wlan_hdd_stop_ap_compat,
+ 	.change_bss = wlan_hdd_cfg80211_change_bss,
+-	.add_key = wlan_hdd_cfg80211_add_key,
+-	.get_key = wlan_hdd_cfg80211_get_key,
+-	.del_key = wlan_hdd_cfg80211_del_key,
+-	.set_default_key = wlan_hdd_cfg80211_set_default_key,
++	.add_key = wlan_hdd_add_key_compat,
++	.get_key = wlan_hdd_get_key_compat,
++	.del_key = wlan_hdd_del_key_compat,
++	.set_default_key = wlan_hdd_set_default_key_compat,
+ 	.scan = wlan_hdd_cfg80211_scan,
+ 	.connect = wlan_hdd_cfg80211_connect,
+ 	.disconnect = wlan_hdd_cfg80211_disconnect,
+ 	.join_ibss = wlan_hdd_cfg80211_join_ibss,
+ 	.leave_ibss = wlan_hdd_cfg80211_leave_ibss,
+-	.set_wiphy_params = wlan_hdd_cfg80211_set_wiphy_params,
+-	.set_tx_power = wlan_hdd_cfg80211_set_txpower,
+-	.get_tx_power = wlan_hdd_cfg80211_get_txpower,
++	.set_wiphy_params = wlan_hdd_set_wiphy_params_compat,
++	.set_tx_power = wlan_hdd_set_txpower_compat,
++	.get_tx_power = wlan_hdd_get_txpower_compat,
+ 	.remain_on_channel = wlan_hdd_cfg80211_remain_on_channel,
+ 	.cancel_remain_on_channel = wlan_hdd_cfg80211_cancel_remain_on_channel,
+ 	.mgmt_tx = wlan_hdd_mgmt_tx,
+ 	.mgmt_tx_cancel_wait = wlan_hdd_cfg80211_mgmt_tx_cancel_wait,
+-	.set_default_mgmt_key = wlan_hdd_set_default_mgmt_key,
++	.set_default_mgmt_key = wlan_hdd_set_default_mgmt_key_compat,
+ 	.set_txq_params = wlan_hdd_set_txq_params,
+ 	.dump_station = wlan_hdd_cfg80211_dump_station,
+ 	.get_station = wlan_hdd_cfg80211_get_station,
+@@ -23137,7 +23334,7 @@ static struct cfg80211_ops wlan_hdd_cfg80211_ops = {
+ 	.update_ft_ies = wlan_hdd_cfg80211_update_ft_ies,
+ #endif
+ #ifdef FEATURE_WLAN_TDLS
+-	.tdls_mgmt = wlan_hdd_cfg80211_tdls_mgmt,
++	.tdls_mgmt = wlan_hdd_tdls_mgmt_compat,
+ 	.tdls_oper = wlan_hdd_cfg80211_tdls_oper,
+ #endif
+ #ifdef WLAN_FEATURE_GTK_OFFLOAD
+@@ -23154,14 +23351,14 @@ static struct cfg80211_ops wlan_hdd_cfg80211_ops = {
+ 	.testmode_cmd = wlan_hdd_cfg80211_testmode,
+ #endif
+ #ifdef QCA_HT_2040_COEX
+-	.set_ap_chanwidth = wlan_hdd_cfg80211_set_ap_channel_width,
++	.set_ap_chanwidth = wlan_hdd_set_ap_chanwidth_compat,
+ #endif
+ 	.dump_survey = wlan_hdd_cfg80211_dump_survey,
+ #ifdef CHANNEL_SWITCH_SUPPORTED
+ 	.channel_switch = wlan_hdd_cfg80211_channel_switch,
+ #endif
+ #ifdef FEATURE_MONITOR_MODE_SUPPORT
+-	.set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,
++	.set_monitor_channel = wlan_hdd_set_monitor_channel_compat,
+ #endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)) || \
+ 	defined(CFG80211_ABORT_SCAN)
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.h b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.h
+index d66addd5eccd1cd6f1cf4419d3ca4df649606acc..10bca4e4fd464396661109e0fd8346303c81c049 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.h
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.h
+@@ -106,7 +106,9 @@ struct hdd_context;
+ #define WLAN_AKM_SUITE_DPP_RSN 0x506f9a02
+ #endif
+ 
++#ifndef WLAN_AKM_SUITE_OWE
+ #define WLAN_AKM_SUITE_OWE 0x000FAC12
++#endif
+ #define WLAN_AKM_SUITE_EAP_SHA256 0x000FAC0B
+ #define WLAN_AKM_SUITE_EAP_SHA384 0x000FAC0C
+ 
+@@ -349,7 +351,7 @@ int wlan_hdd_send_avoid_freq_event(struct hdd_context *hdd_ctx,
+  * Return: 0 on success or failure reason
+  */
+ int wlan_hdd_send_hang_reason_event(struct hdd_context *hdd_ctx,
+-				    uint32_t reason);
++				    enum qdf_hang_reason reason);
+ 
+ int wlan_hdd_send_avoid_freq_for_dnbs(struct hdd_context *hdd_ctx,
+ 				      uint8_t op_chan);
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_ext_scan.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_ext_scan.c
+index adc27971076b0df87814e4a838a5606442ca656b..7952df554dd8e585cb668403162355f6783836a9 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_ext_scan.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_ext_scan.c
+@@ -822,7 +822,6 @@ wlan_hdd_cfg80211_extscan_full_scan_result_event(void *ctx,
+ {
+ 	struct hdd_context *hdd_ctx = (struct hdd_context *) ctx;
+ 	struct sk_buff *skb = NULL;
+-	struct timespec ts;
+ 	struct hdd_ext_scan_context *context;
+ 
+ 	int flags = cds_get_gfp_flags();
+@@ -858,8 +857,7 @@ wlan_hdd_cfg80211_extscan_full_scan_result_event(void *ctx,
+ 	 * Android does not want the time stamp from the frame.
+ 	 * Instead it wants a monotonic increasing value since boot
+ 	 */
+-	get_monotonic_boottime(&ts);
+-	pData->ap.ts = ((u64)ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
++	pData->ap.ts = ktime_get_boottime_ns() / NSEC_PER_USEC;
+ 
+ 	hdd_debug("Req Id %u More Data %u", pData->requestId,
+ 	       pData->moreData);
+@@ -4000,7 +3998,7 @@ static int hdd_extscan_passpoint_fill_network_list(
+ 	struct nlattr *network[QCA_WLAN_VENDOR_ATTR_PNO_MAX + 1];
+ 	struct nlattr *networks;
+ 	int rem1;
+-	size_t len;
++	ssize_t len;
+ 	uint8_t index;
+ 	uint32_t expected_networks;
+ 
+@@ -4042,12 +4040,12 @@ static int hdd_extscan_passpoint_fill_network_list(
+ 			hdd_err("attr realm failed");
+ 			return -EINVAL;
+ 		}
+-		len = nla_strlcpy(req_msg->networks[index].realm,
++		len = nla_strscpy(req_msg->networks[index].realm,
+ 				  network[PARAM_REALM],
+ 				  SIR_PASSPOINT_REALM_LEN);
+ 		/* Don't send partial realm to firmware */
+-		if (len >= SIR_PASSPOINT_REALM_LEN) {
+-			hdd_err("user passed invalid realm, len:%zu", len);
++		if (len < 0) {
++			hdd_err("user passed invalid realm: %zd", len);
+ 			return -EINVAL;
+ 		}
+ 
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
+index b4dc83c6cc5dbd75fa22771374d5e2b10cca4f22..01d139f61b559b1ef619d84b633d0bf22fb1b77d 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
+@@ -724,7 +724,7 @@ static int __hdd_hostapd_set_mac_address(struct net_device *dev, void *addr)
+ 		 dev->name);
+ 	hdd_update_dynamic_mac(hdd_ctx, &adapter->mac_addr, &mac_addr);
+ 	memcpy(&adapter->mac_addr, psta_mac_addr->sa_data, ETH_ALEN);
+-	memcpy(dev->dev_addr, psta_mac_addr->sa_data, ETH_ALEN);
++	eth_hw_addr_set(dev, psta_mac_addr->sa_data);
+ 	hdd_exit();
+ 	return 0;
+ }
+@@ -901,7 +901,7 @@ QDF_STATUS hdd_chan_change_notify(struct hdd_adapter *adapter,
+ 		chandef.chan->center_freq, chandef.width, chandef.center_freq1,
+ 		chandef.center_freq2);
+ 
+-	cfg80211_ch_switch_notify(dev, &chandef);
++	cfg80211_ch_switch_notify(dev, &chandef, 0);
+ 
+ 	return QDF_STATUS_SUCCESS;
+ }
+@@ -6555,8 +6555,7 @@ struct hdd_adapter *hdd_wlan_create_ap_dev(struct hdd_context *hdd_ctx,
+ 		dev->features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+ 	dev->features |= NETIF_F_RXCSUM;
+ 
+-	qdf_mem_copy(dev->dev_addr, (void *)macAddr,
+-		     sizeof(tSirMacAddr));
++	eth_hw_addr_set(dev, macAddr);
+ 	qdf_mem_copy(adapter->mac_addr.bytes,
+ 		     (void *)macAddr, sizeof(tSirMacAddr));
+ 
+@@ -9168,9 +9167,15 @@ static int __wlan_hdd_cfg80211_start_ap(struct wiphy *wiphy,
+ 
+ 		hdd_start_tsf_sync(adapter);
+ 
+-		if (wdev->chandef.chan->center_freq !=
+-				params->chandef.chan->center_freq)
+-			params->chandef = wdev->chandef;
++		{
++			struct cfg80211_chan_def *active_chandef;
++
++			active_chandef = wdev_chandef(wdev, 0);
++			if (active_chandef && active_chandef->chan &&
++			    active_chandef->chan->center_freq !=
++					params->chandef.chan->center_freq)
++				params->chandef = *active_chandef;
++		}
+ 		/*
+ 		 * If Do_Not_Break_Stream enabled send avoid channel list
+ 		 * to application.
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index 3bc1eaf5f9740730cc1290c08b807a3032d1511e..ad156c081c6b2d8c8ed2ed55a3b381f56949a5a7 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -71,9 +71,6 @@
+ #include <linux/semaphore.h>
+ #include <linux/ctype.h>
+ #include <linux/compat.h>
+-#ifdef MSM_PLATFORM
+-#include <soc/qcom/subsystem_restart.h>
+-#endif
+ #include <wlan_hdd_hostapd.h>
+ #include <wlan_hdd_softap_tx_rx.h>
+ #include <wlan_hdd_green_ap.h>
+@@ -3673,7 +3670,7 @@ static int __hdd_set_mac_address(struct net_device *dev, void *addr)
+ 
+ 	hdd_update_dynamic_mac(hdd_ctx, &adapter->mac_addr, &mac_addr);
+ 	memcpy(&adapter->mac_addr, psta_mac_addr->sa_data, ETH_ALEN);
+-	memcpy(dev->dev_addr, psta_mac_addr->sa_data, ETH_ALEN);
++	eth_hw_addr_set(dev, psta_mac_addr->sa_data);
+ 
+ 	hdd_exit();
+ 	return qdf_ret_status;
+@@ -4044,7 +4041,7 @@ hdd_alloc_station_adapter(struct hdd_context *hdd_ctx, tSirMacAddr mac_addr,
+ 	/* Init the net_device structure */
+ 	strlcpy(dev->name, name, IFNAMSIZ);
+ 
+-	qdf_mem_copy(dev->dev_addr, mac_addr, sizeof(tSirMacAddr));
++	eth_hw_addr_set(dev, mac_addr);
+ 	qdf_mem_copy(adapter->mac_addr.bytes, mac_addr, sizeof(tSirMacAddr));
+ 	dev->watchdog_timeo = HDD_TX_TIMEOUT;
+ 
+@@ -6584,14 +6581,14 @@ static void hdd_connect_done(struct net_device *dev, const u8 *bssid,
+ 		fils_params.status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 	} else {
+ 		fils_params.status = status;
+-		fils_params.bssid = bssid;
++		fils_params.links[0].bssid = bssid;
+ 		fils_params.timeout_reason =
+ 				hdd_convert_timeout_reason(timeout_reason);
+ 		fils_params.req_ie = req_ie;
+ 		fils_params.req_ie_len = req_ie_len;
+ 		fils_params.resp_ie = resp_ie;
+ 		fils_params.resp_ie_len = resp_ie_len;
+-		fils_params.bss = bss;
++		fils_params.links[0].bss = bss;
+ 		hdd_populate_fils_params(&fils_params, roam_fils_params->kek,
+ 					 roam_fils_params->kek_len,
+ 					 roam_fils_params->fils_pmk,
+@@ -6852,7 +6849,8 @@ int wlan_hdd_set_mon_chan(struct hdd_adapter *adapter, uint32_t chan,
+ static void hdd_stop_p2p_go(struct hdd_adapter *adapter)
+ {
+ 	hdd_debug("[SSR] send stop ap to supplicant");
+-	cfg80211_ap_stopped(adapter->dev, GFP_KERNEL);
++	cfg80211_stop_iface(adapter->wdev.wiphy, &adapter->wdev,
++			    GFP_KERNEL);
+ }
+ 
+ static inline void hdd_delete_sta(struct hdd_adapter *adapter)
+@@ -13308,7 +13306,7 @@ static int  wlan_hdd_state_ctrl_param_create(void)
+ 	}
+ 	wlan_hdd_state_major = MAJOR(device);
+ 
+-	class = class_create(THIS_MODULE, WLAN_MODULE_NAME);
++	class = class_create(WLAN_MODULE_NAME);
+ 	if (IS_ERR(class)) {
+ 		pr_err("wlan_hdd_state class_create error");
+ 		goto class_err;
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_memdump.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_memdump.c
+index 9156d2b3de98a50b4714396349117730a74fcb28..92c3bdfcc13a80260e01fc4eb2b3b875fddc3561 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_memdump.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_memdump.c
+@@ -55,7 +55,7 @@ static void *memdump_get_file_data(struct file *file)
+ {
+ 	void *hdd_ctx;
+ 
+-	hdd_ctx = PDE_DATA(file_inode(file));
++	hdd_ctx = pde_data(file_inode(file));
+ 	return hdd_ctx;
+ }
+ 
+@@ -196,14 +196,14 @@ static ssize_t hdd_driver_memdump_read(struct file *file, char __user *buf,
+ }
+ 
+ /**
+- * struct driver_dump_fops - file operations for driver dump feature
++ * struct driver_dump_proc_ops - proc operations for driver dump feature
+  * @read - read function for driver dump operation.
+  *
+  * This structure initialize the file operation handle for memory
+  * dump feature
+  */
+-static const struct file_operations driver_dump_fops = {
+-read: hdd_driver_memdump_read
++static const struct proc_ops driver_dump_proc_ops = {
++	.proc_read = hdd_driver_memdump_read,
+ };
+ 
+ /**
+@@ -226,7 +226,7 @@ static int hdd_driver_memdump_procfs_init(struct hdd_context *hdd_ctx)
+ 
+ 	proc_file_driver = proc_create_data(PROCFS_DRIVER_DUMP_NAME,
+ 				     PROCFS_DRIVER_DUMP_PERM, proc_dir_driver,
+-				     &driver_dump_fops, hdd_ctx);
++				     &driver_dump_proc_ops, hdd_ctx);
+ 	if (proc_file_driver == NULL) {
+ 		remove_proc_entry(PROCFS_DRIVER_DUMP_NAME, proc_dir_driver);
+ 		pr_debug("Could not initialize /proc/%s\n",
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.c
+index b7d93cd436722bec1303097987b77868fd9e3495..33f95e4b7fabd32c244119225c1829e45bb4f74f 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.c
+@@ -891,7 +891,7 @@ static int wlan_hdd_vendor_scan_random_attr(struct wiphy *wiphy,
+ 		return 0;
+ 
+ 	if (!(wiphy->features & NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR) ||
+-	    (wdev->current_bss)) {
++	    wdev->links[0].client.current_bss) {
+ 		hdd_err("SCAN RANDOMIZATION not supported");
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -940,17 +940,19 @@ static int wlan_hdd_vendor_scan_random_attr(struct wiphy *wiphy,
+ }
+ #endif
+ 
+-static const
+-struct nla_policy scan_policy[QCA_WLAN_VENDOR_ATTR_SCAN_MAX + 1] = {
++const struct nla_policy scan_policy[QCA_WLAN_VENDOR_ATTR_SCAN_MAX + 1] = {
+ 	[QCA_WLAN_VENDOR_ATTR_SCAN_FLAGS] = {.type = NLA_U32},
+ 	[QCA_WLAN_VENDOR_ATTR_SCAN_TX_NO_CCK_RATE] = {.type = NLA_FLAG},
+ 	[QCA_WLAN_VENDOR_ATTR_SCAN_COOKIE] = {.type = NLA_U64},
+ 	[QCA_WLAN_VENDOR_ATTR_SCAN_IE] = {.type = NLA_BINARY,
+ 					  .len = MAX_DEFAULT_SCAN_IE_LEN},
+-	[QCA_WLAN_VENDOR_ATTR_SCAN_MAC] = {.type = NLA_UNSPEC,
+-					   .len = QDF_MAC_ADDR_SIZE},
+-	[QCA_WLAN_VENDOR_ATTR_SCAN_MAC_MASK] = {.type = NLA_UNSPEC,
+-						.len = QDF_MAC_ADDR_SIZE},
++	[QCA_WLAN_VENDOR_ATTR_SCAN_FREQUENCIES] = {.type = NLA_NESTED},
++	[QCA_WLAN_VENDOR_ATTR_SCAN_SSIDS] = {.type = NLA_NESTED},
++	[QCA_WLAN_VENDOR_ATTR_SCAN_SUPP_RATES] = {.type = NLA_NESTED},
++	[QCA_WLAN_VENDOR_ATTR_SCAN_STATUS] = {.type = NLA_U8},
++	[QCA_WLAN_VENDOR_ATTR_SCAN_MAC] = NLA_POLICY_EXACT_LEN(ETH_ALEN),
++	[QCA_WLAN_VENDOR_ATTR_SCAN_MAC_MASK] = NLA_POLICY_EXACT_LEN(ETH_ALEN),
++	[QCA_WLAN_VENDOR_ATTR_SCAN_BSSID] = NLA_POLICY_EXACT_LEN(ETH_ALEN),
+ };
+ 
+ /**
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.h b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.h
+index bcc874b43be376facea453990fdbfe62ed17742f..fd969c19391fcdf9ed1c152b26a0fae4348783c5 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.h
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_scan.h
+@@ -30,6 +30,9 @@
+ #include "csr_inside_api.h"
+ #include <wlan_cfg80211_scan.h>
+ 
++extern const struct nla_policy
++scan_policy[QCA_WLAN_VENDOR_ATTR_SCAN_MAX + 1];
++
+ #define MAX_PENDING_LOG 5
+ 
+ /* (30 Mins) */
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c
+index 2d3abbea9114fd07449f0fa1bf9a35bb6d64e561..0181511c73120f6d8054d5844b4edc6cddbb046d 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c
+@@ -729,7 +729,7 @@ static void __hdd_softap_tx_timeout(struct net_device *dev)
+ 	}
+ }
+ 
+-void hdd_softap_tx_timeout(struct net_device *dev)
++void hdd_softap_tx_timeout(struct net_device *dev, unsigned int txqueue)
+ {
+ 	cds_ssr_protect(__func__);
+ 	__hdd_softap_tx_timeout(dev);
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+index f4c7d9f325cafa9ef30d52273ef9ab28ef61eae4..9243aa497479186c1524571e38a60974bbbafc50 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+@@ -39,6 +39,7 @@
+ #include <wlan_hdd_p2p.h>
+ #include <linux/wireless.h>
+ #include <net/cfg80211.h>
++#include <net/gro.h>
+ #include <net/ieee80211_radiotap.h>
+ #include "sap_api.h"
+ #include "wlan_hdd_wmm.h"
+@@ -1048,6 +1049,13 @@ static netdev_tx_t __hdd_hard_start_xmit(struct sk_buff *skb,
+ 		++adapter->hdd_stats.tx_rx_stats.tx_dropped_ac[ac];
+ 		goto drop_pkt_and_release_skb;
+ 	}
++	if (QDF_NBUF_CB_GET_PACKET_TYPE(skb) ==
++	    QDF_NBUF_CB_PACKET_TYPE_EAPOL)
++		QDF_TRACE(QDF_MODULE_ID_HDD_DATA, QDF_TRACE_LEVEL_INFO_HIGH,
++			  "CLOVER_TX_TRACE hdd-submit vdev=%u len=%u queue=%u up=%u sta=%u authenticated=%u",
++			  adapter->session_id, skb->len, skb->queue_mapping,
++			  skb->priority, STAId,
++			  sta_ctx->conn_info.uIsAuthenticated);
+ 
+ 	if (adapter->tx_fn(adapter->txrx_vdev,
+ 		 (qdf_nbuf_t)skb) != NULL) {
+@@ -1236,7 +1244,7 @@ static void __hdd_tx_timeout(struct net_device *dev)
+  *
+  * Return: none
+  */
+-void hdd_tx_timeout(struct net_device *dev)
++void hdd_tx_timeout(struct net_device *dev, unsigned int txqueue)
+ {
+ 	cds_ssr_protect(__func__);
+ 	__hdd_tx_timeout(dev);
+@@ -1535,6 +1543,16 @@ out:
+ 	return status;
+ }
+ 
++static void hdd_gro_normal_list(struct gro_node *gro)
++{
++	if (!gro->rx_count)
++		return;
++
++	netif_receive_skb_list(&gro->rx_list);
++	INIT_LIST_HEAD(&gro->rx_list);
++	gro->rx_count = 0;
++}
++
+ /**
+  * hdd_rxthread_napi_gro_flush() - GRO flush callback for NAPI+Rx_Thread Rx mode
+  * @data: hif NAPI context
+@@ -1553,6 +1571,12 @@ static void hdd_rxthread_napi_gro_flush(void *data)
+ 	 * corresponds each hif_napi.
+ 	 */
+ 	napi_gro_flush(&qca_napii->rx_thread_napi, false);
++	/*
++	 * Linux 6.19 batches GRO_NORMAL packets separately. Flush that queue
++	 * through the public module API as well, otherwise short TCP packets can
++	 * remain queued until an unrelated receive burst fills the batch.
++	 */
++	hdd_gro_normal_list(&qca_napii->rx_thread_napi.gro);
+ 	local_bh_enable();
+ }
+ 
+@@ -2112,7 +2136,7 @@ static void wlan_hdd_update_txq_timestamp(struct net_device *dev)
+ 		 */
+ 		if (!hdd_netdev_queue_is_locked(txq)) {
+ 			if (__netif_tx_trylock(txq)) {
+-				txq_trans_update(txq);
++				txq_trans_update(dev, txq);
+ 				__netif_tx_unlock(txq);
+ 			}
+ 		}
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wmm.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wmm.c
+index 94324407b4ff8681e43a71b7adea8abde5b86e7d..ffeba2b56c979b13eb3ce27a8da1fa48632321bd 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wmm.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wmm.c
+@@ -1608,7 +1608,13 @@ static uint16_t hdd_wmm_select_queue(struct net_device *dev,
+ 	return queueIndex;
+ }
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0))
++uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
++			  struct net_device *sb_dev)
++{
++	return hdd_wmm_select_queue(dev, skb);
++}
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+ uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+ 			  struct net_device *sb_dev,
+ 			  select_queue_fallback_t fallback)
+diff --git a/drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h b/drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h
+index 4a4af2c31fc23abeabfe2d2cefdad6f37d2c9230..008bd193825c9d184d56c784a8234f0ac6679f1b 100644
+--- a/drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h
++++ b/drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h
+@@ -29,7 +29,7 @@
+ #ifndef __PARSE_H__
+ #define __PARSE_H__
+ 
+-#include <stdarg.h>
++#include <linux/stdarg.h>
+ #include "sir_mac_prop_exts.h"
+ #include "dot11f.h"
+ #include "lim_ft_defs.h"
+diff --git a/drivers/staging/qcacld-3.0/core/mac/src/include/utils_api.h b/drivers/staging/qcacld-3.0/core/mac/src/include/utils_api.h
+index 2094a9e3b1aad4731a3ac92493f472600be21560..5d9b84953c5134275f647125bf4443761c4b9b8d 100644
+--- a/drivers/staging/qcacld-3.0/core/mac/src/include/utils_api.h
++++ b/drivers/staging/qcacld-3.0/core/mac/src/include/utils_api.h
+@@ -19,7 +19,7 @@
+ #ifndef __UTILSAPI_H
+ #define __UTILSAPI_H
+ 
+-#include <stdarg.h>
++#include <linux/stdarg.h>
+ #include <sir_common.h>
+ #include "ani_global.h"
+ #include "sys_wrapper.h"
+diff --git a/drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/inc/utils_parser.h b/drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/inc/utils_parser.h
+index b7f87fac048609a9a3ec9d0751ab890577d85916..e06ad599c31e0ec63cc26b9be0fef133642e7dcc 100644
+--- a/drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/inc/utils_parser.h
++++ b/drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/inc/utils_parser.h
+@@ -30,7 +30,7 @@
+ #ifndef __UTILS_PARSE_H__
+ #define __UTILS_PARSE_H__
+ 
+-#include <stdarg.h>
++#include <linux/stdarg.h>
+ #include "sir_api.h"
+ #include "dot11f.h"
+ #include "utils_api.h"
+diff --git a/drivers/staging/qcacld-3.0/core/pld/src/pld_common.c b/drivers/staging/qcacld-3.0/core/pld/src/pld_common.c
+index 801fa48a9119700588c503768699cccabca22683..84417b7adc094fbbcb3ed3ce4ae5a8027b4b4044 100644
+--- a/drivers/staging/qcacld-3.0/core/pld/src/pld_common.c
++++ b/drivers/staging/qcacld-3.0/core/pld/src/pld_common.c
+@@ -424,20 +424,14 @@ void pld_get_default_fw_files(struct pld_fw_files *pfw_files)
+ {
+ 	memset(pfw_files, 0, sizeof(*pfw_files));
+ 
+-	strlcpy(pfw_files->image_file, PLD_IMAGE_FILE,
+-		PLD_MAX_FILE_NAME);
+-	strlcpy(pfw_files->board_data, PLD_BOARD_DATA_FILE,
+-		PLD_MAX_FILE_NAME);
+-	strlcpy(pfw_files->otp_data, PLD_OTP_FILE,
+-		PLD_MAX_FILE_NAME);
+-	strlcpy(pfw_files->utf_file, PLD_UTF_FIRMWARE_FILE,
+-		PLD_MAX_FILE_NAME);
+-	strlcpy(pfw_files->utf_board_data, PLD_BOARD_DATA_FILE,
+-		PLD_MAX_FILE_NAME);
+-	strlcpy(pfw_files->epping_file, PLD_EPPING_FILE,
+-		PLD_MAX_FILE_NAME);
+-	strlcpy(pfw_files->setup_file, PLD_SETUP_FILE,
++	strscpy(pfw_files->image_file, PLD_IMAGE_FILE, PLD_MAX_FILE_NAME);
++	strscpy(pfw_files->board_data, PLD_BOARD_DATA_FILE, PLD_MAX_FILE_NAME);
++	strscpy(pfw_files->otp_data, PLD_OTP_FILE, PLD_MAX_FILE_NAME);
++	strscpy(pfw_files->utf_file, PLD_UTF_FIRMWARE_FILE, PLD_MAX_FILE_NAME);
++	strscpy(pfw_files->utf_board_data, PLD_BOARD_DATA_FILE,
+ 		PLD_MAX_FILE_NAME);
++	strscpy(pfw_files->epping_file, PLD_EPPING_FILE, PLD_MAX_FILE_NAME);
++	strscpy(pfw_files->setup_file, PLD_SETUP_FILE, PLD_MAX_FILE_NAME);
+ }
+ 
+ /**
+@@ -1621,7 +1615,8 @@ int pld_idle_shutdown(struct device *dev,
+ 		errno = shutdown_cb(dev);
+ 		break;
+ 	case PLD_BUS_TYPE_SNOC:
+-		errno = pld_snoc_idle_shutdown(dev);
++		/* The modern ICNSS ABI has no idle callback indirection. */
++		errno = shutdown_cb(dev);
+ 		break;
+ 	default:
+ 		pr_err("Invalid device type %d\n", type);
+@@ -1648,7 +1643,8 @@ int pld_idle_restart(struct device *dev,
+ 		errno = restart_cb(dev);
+ 		break;
+ 	case PLD_BUS_TYPE_SNOC:
+-		errno = pld_snoc_idle_restart(dev);
++		/* Pair the synchronous restart request with the shutdown above. */
++		errno = restart_cb(dev);
+ 		break;
+ 	default:
+ 		pr_err("Invalid device type %d\n", type);
+diff --git a/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.c b/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.c
+index adca3f9f3bcc9848eb7ec0b396d2dfd0c5db34a5..4a95283de468a5198b76b91150d66b905258de8e 100644
+--- a/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.c
++++ b/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.c
+@@ -30,45 +30,14 @@
+ 
+ #ifdef CONFIG_PLD_SNOC_ICNSS
+ 
+-/**
+- * pld_snoc_idle_restart_cb() - Perform idle restart
+- * @pdev: platform device
+- *
+- * This function will be called if there is an idle restart request
+- *
+- * Return: int
+- */
+-static int pld_snoc_idle_restart_cb(struct device *dev)
+-{
+-	struct pld_context *pld_context;
++static atomic_t pld_snoc_fw_down = ATOMIC_INIT(0);
+ 
+-	pld_context = pld_get_global_context();
+-	if (pld_context->ops->idle_restart)
+-		return pld_context->ops->idle_restart(dev,
+-						      PLD_BUS_TYPE_SNOC);
+-
+-	return -ENODEV;
+-}
+-
+-/**
+- * pld_snoc_idle_shutdown_cb() - Perform idle shutdown
+- * @pdev: PCIE device
+- * @id: PCIE device ID
+- *
+- * This function will be called if there is an idle shutdown request
+- *
+- * Return: int
+- */
+-static int pld_snoc_idle_shutdown_cb(struct device *dev)
++int pld_snoc_is_fw_down(struct device *dev)
+ {
+-	struct pld_context *pld_context;
+-
+-	pld_context = pld_get_global_context();
+-	if (pld_context->ops->shutdown)
+-		return pld_context->ops->idle_shutdown(dev,
+-						       PLD_BUS_TYPE_SNOC);
++	if (!dev)
++		return -ENODEV;
+ 
+-	return -ENODEV;
++	return atomic_read(&pld_snoc_fw_down);
+ }
+ 
+ /**
+@@ -95,8 +64,11 @@ static int pld_snoc_probe(struct device *dev)
+ 	if (ret)
+ 		goto out;
+ 
+-	return pld_context->ops->probe(dev, PLD_BUS_TYPE_SNOC,
+-				       NULL, NULL);
++	ret = pld_context->ops->probe(dev, PLD_BUS_TYPE_SNOC, NULL, NULL);
++	if (!ret)
++		atomic_set(&pld_snoc_fw_down, 0);
++
++	return ret;
+ 
+ out:
+ 	return ret;
+@@ -137,11 +109,15 @@ static void pld_snoc_remove(struct device *dev)
+ static int pld_snoc_reinit(struct device *dev)
+ {
+ 	struct pld_context *pld_context;
++	int ret;
+ 
+ 	pld_context = pld_get_global_context();
+-	if (pld_context->ops->reinit)
+-		return pld_context->ops->reinit(dev, PLD_BUS_TYPE_SNOC,
+-						NULL, NULL);
++	if (pld_context->ops->reinit) {
++		ret = pld_context->ops->reinit(dev, PLD_BUS_TYPE_SNOC, NULL, NULL);
++		if (!ret)
++			atomic_set(&pld_snoc_fw_down, 0);
++		return ret;
++	}
+ 
+ 	return -ENODEV;
+ }
+@@ -158,6 +134,7 @@ static void pld_snoc_shutdown(struct device *dev)
+ {
+ 	struct pld_context *pld_context;
+ 
++	atomic_set(&pld_snoc_fw_down, 1);
+ 	pld_context = pld_get_global_context();
+ 	if (pld_context->ops->shutdown)
+ 		pld_context->ops->shutdown(dev, PLD_BUS_TYPE_SNOC);
+@@ -292,6 +269,7 @@ static int pld_snoc_uevent(struct device *dev,
+ 	case ICNSS_UEVENT_FW_DOWN:
+ 		if (uevent->data == NULL)
+ 			return -EINVAL;
++		atomic_set(&pld_snoc_fw_down, 1);
+ 		uevent_data = (struct icnss_uevent_fw_down_data *)uevent->data;
+ 		data.uevent = PLD_FW_DOWN;
+ 		data.fw_down.crashed = uevent_data->crashed;
+@@ -323,8 +301,6 @@ struct icnss_driver_ops pld_snoc_ops = {
+ 	.suspend_noirq = pld_snoc_suspend_noirq,
+ 	.resume_noirq = pld_snoc_resume_noirq,
+ 	.uevent = pld_snoc_uevent,
+-	.idle_restart  = pld_snoc_idle_restart_cb,
+-	.idle_shutdown = pld_snoc_idle_shutdown_cb,
+ };
+ 
+ /**
+@@ -442,8 +418,8 @@ int pld_snoc_get_soc_info(struct device *dev, struct pld_soc_info *info)
+ 	info->board_id = icnss_info.board_id;
+ 	info->soc_id = icnss_info.soc_id;
+ 	info->fw_version = icnss_info.fw_version;
+-	strlcpy(info->fw_build_timestamp, icnss_info.fw_build_timestamp,
+-		sizeof(info->fw_build_timestamp));
++	strscpy(info->fw_build_timestamp, icnss_info.fw_build_timestamp,
++		 sizeof(info->fw_build_timestamp));
+ 
+ 	return 0;
+ }
+diff --git a/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.h b/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.h
+index 53084a06ed25c39e083a8a1d9f64f80d66c713e8..e9af5b66c42dadf9fde62092548d2c8a679a2e83 100644
+--- a/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.h
++++ b/drivers/staging/qcacld-3.0/core/pld/src/pld_snoc.h
+@@ -21,6 +21,7 @@
+ 
+ #ifdef CONFIG_PLD_SNOC_ICNSS
+ #include <soc/qcom/icnss.h>
++#include <linux/iommu.h>
+ #endif
+ #include "pld_internal.h"
+ 
+@@ -228,7 +229,7 @@ static inline int pld_snoc_athdiag_write(struct device *dev, uint32_t offset,
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+ static inline void *pld_snoc_smmu_get_domain(struct device *dev)
+ {
+-	return icnss_smmu_get_domain(dev);
++	return iommu_get_domain_for_dev(dev);
+ }
+ 
+ #else
+@@ -249,10 +250,7 @@ unsigned int pld_snoc_socinfo_get_serial_number(struct device *dev)
+ 	return icnss_socinfo_get_serial_number(dev);
+ }
+ 
+-static inline int pld_snoc_is_fw_down(struct device *dev)
+-{
+-	return icnss_is_fw_down();
+-}
++int pld_snoc_is_fw_down(struct device *dev);
+ 
+ static inline int pld_snoc_is_qmi_disable(struct device *dev)
+ {
+@@ -277,21 +275,14 @@ static inline int pld_snoc_force_assert_target(struct device *dev)
+ 
+ static inline int pld_snoc_is_pdr(void)
+ {
+-	return icnss_is_pdr();
++	/* The modern backend has no downstream PDR notifier. */
++	return 0;
+ }
+ 
+ static inline int pld_snoc_is_fw_rejuvenate(void)
+ {
+-	return icnss_is_rejuvenate();
+-}
+-static inline int pld_snoc_idle_restart(struct device *dev)
+-{
+-	return icnss_idle_restart(dev);
+-}
+-
+-static inline int pld_snoc_idle_shutdown(struct device *dev)
+-{
+-	return icnss_idle_shutdown(dev);
++	/* WLFW service recovery has no downstream rejuvenation indication. */
++	return 0;
+ }
+ #endif
+ #endif
+diff --git a/drivers/staging/qcacld-3.0/core/wma/src/wma_mgmt.c b/drivers/staging/qcacld-3.0/core/wma/src/wma_mgmt.c
+index 4f87a4d8bfede3276e9c9794368c870a8f0cad3d..8cb1aa2a346f35e27ce62ec78349f0ddebeeb959 100644
+--- a/drivers/staging/qcacld-3.0/core/wma/src/wma_mgmt.c
++++ b/drivers/staging/qcacld-3.0/core/wma/src/wma_mgmt.c
+@@ -903,9 +903,11 @@ int wma_vdev_install_key_complete_event_handler(void *handle,
+ 		return -EINVAL;
+ 	}
+ 	/*
+-	 * Do nothing for now. Completion of set key is already indicated to lim
++	 * Do nothing for now. Completion of set key is already indicated to lim.
++	 * Keep a privacy-safe Clover frontier marker for the r48 WPA diagnosis.
+ 	 */
+-	WMA_LOGD("%s: WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID", __func__);
++	WMA_LOGI("CLOVER_KEY_TRACE wmi-install-complete vdev=%u status=%u",
++		 key_fp->vdev_id, key_fp->status);
+ 	return 0;
+ }
+ /*
+ /*

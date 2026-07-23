@@ -122,3 +122,21 @@ ENV/
 
 # child pipeline
 .ci/build-jobs.yaml
+
+# Local Clover build products
+*.apk
+*.img
+*.ko
+*.ko.zst
+*.o
+*.a
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+*.sha256
+*-build.log
+*-build.status
+features
+out/
+build/

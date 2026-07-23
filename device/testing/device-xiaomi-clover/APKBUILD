@@ -1,9 +1,8 @@
 # Reference: <https://postmarketos.org/devicepkg>
-maintainer=""
 pkgname=device-xiaomi-clover
 pkgdesc="Xiaomi Mi Pad 4"
-pkgver=10
-pkgrel=0
+pkgver=11
+pkgrel=3
 url="https://postmarketos.org"
 license="MIT"
 arch="aarch64"
@@ -23,10 +22,18 @@ subpackages="
 	$pkgname-kernel-cloverplus:kernel_cloverplus
 "
 source="
+	80-xiaomi-clover-wlan-mac.rules
+	90-xiaomi-clover-wifi.conf
+	90-xiaomi-clover-qcacld.conf
+	90-xiaomi-clover-qcacld.modules
+	WCNSS_qcom_cfg.ini
+	clover-wifi-driver
 	deviceinfo
-	kernel-cmdline.conf
 	modules-initfs.clover
 	modules-initfs.cloverplus
+	wifi-macaddr.sh
+	xiaomi-clover-wlan-mac.service
+	xiaomi-clover-wlan-reset
 "
 
 build() {
@@ -35,6 +42,41 @@ build() {
 
 package() {
 	devicepkg_package $startdir $pkgname
+
+	install -Dm755 "$srcdir"/wifi-macaddr.sh \
+		-t "$pkgdir"/usr/lib/device-xiaomi-clover/
+
+	install -Dm644 "$srcdir"/80-xiaomi-clover-wlan-mac.rules \
+		-t "$pkgdir"/usr/lib/udev/rules.d/
+
+	install -Dm644 "$srcdir"/xiaomi-clover-wlan-mac.service \
+		-t "$pkgdir"/usr/lib/systemd/system/
+
+	install -Dm644 "$srcdir"/90-xiaomi-clover-wifi.conf \
+		-t "$pkgdir"/usr/lib/NetworkManager/conf.d/
+
+	# QCACLD owns Clover's WCN3990 on every normal boot.  It must be selected
+	# before module autoload, as ath10k_snoc and QCACLD cannot bind together.
+	install -Dm644 "$srcdir"/90-xiaomi-clover-qcacld.conf \
+		"$pkgdir"/etc/modprobe.d/90-xiaomi-clover-qcacld.conf
+	install -Dm644 "$srcdir"/90-xiaomi-clover-qcacld.modules \
+		"$pkgdir"/etc/modules-load.d/90-xiaomi-clover-qcacld.conf
+
+	# Xiaomi SDM660 qcacld requests this exact firmware-class path.
+	install -Dm644 "$srcdir"/WCNSS_qcom_cfg.ini \
+		"$pkgdir"/lib/firmware/wlan/qca_cld/WCNSS_qcom_cfg.ini
+
+	install -Dm755 "$srcdir"/clover-wifi-driver \
+		"$pkgdir"/usr/sbin/clover-wifi-driver
+
+	install -Dm755 "$srcdir"/xiaomi-clover-wlan-reset \
+		-t "$pkgdir"/usr/lib/NetworkManager/dispatcher.d/
+
+	# bootmac generates a stable but synthetic MAC from machine-id/serial.
+	# Clover has the real factory WLAN MAC in persist, so disable only the
+	# generic WLAN bootmac rule and keep Bluetooth handling untouched.
+	mkdir -p "$pkgdir"/etc/udev/rules.d
+	ln -s /dev/null "$pkgdir"/etc/udev/rules.d/90-bootmac-wifi.rules
 }
 
 kernel_clover() {
@@ -50,8 +92,16 @@ kernel_cloverplus() {
 }
 
 sha512sums="
-e5effa54200cfde9d43e413ea5aae949025b27493f7c89774741139d153248e4901109143ad180d92a8526b18e70eeddfbe382576f98e95405729631a5e105e5  deviceinfo
-83366cefaa8481dfe72b44a6373badbfb8f15a6a88bcbaa97735405d6d46a5b9c19b464a84cea703b9294b9500834ad4fa00f61506087b42be64f0348cea64e8  kernel-cmdline.conf
-9549e37b6f572dc27130034a0937380bc8e7e4d45223ca9fca0ef8be662aac0607a24aea0abec5d50b0d56d367d7247897fdeaa50b68004e0ff4ffd79fa0cdba  modules-initfs.clover
-cc84349341862a9d141f0b48ec05e33602a2c22c57f8516f6e08dd36315c1d1b7e1e12cfc197dd88cd6c08dda485882c9e895db0da171fe85bdf3e5e8fc92e56  modules-initfs.cloverplus
+a798d825f05e07c0520549bac0a8653054b261e35964cb1e4b5436d05249d5ba590f904ae4dbb9edc87871bb8d2cefbcd9a1e905897f8e9ef8fe043e1439ba91  80-xiaomi-clover-wlan-mac.rules
+efc57ccf15057ca4f91b73a7eb56f489a5e92bdb0cfad75d6e60bdc3a2da57969a797ca85f3c2bb4fc7d0185d2081ba84a08f0d4b08f578295efc4082fa88222  90-xiaomi-clover-wifi.conf
+09f58d7fa7955ae47eb5232d76a436cf17a9da94ea773c3c85341bdc1bb63bb935f76bfa62454b8f6ef6550af5aa8d83980b603986d22a8992e2127cdeab05b5  90-xiaomi-clover-qcacld.conf
+5ccf339a2157f6316b1af85668048e8a64e99619cfd1bd49aa71490c05697ccb8fc8499d75759889f5ece3ae2d283b133ff4ebfc90de63fce8a34c0b0a5f3edf  90-xiaomi-clover-qcacld.modules
+9643fa77b86e9604aba8680ba9df9980287eafa9fd79876893cc468f4a5ebf53a91d94d3b7aa2d360d136ee52c9cffc0aa7ea4a3976cebcada8d05aaecb06bec  WCNSS_qcom_cfg.ini
+6f680419fc1d841ccbaf8f02e6abe6203f6e81b86b524e3c288da9c33d9cfb7cbdb8ebfbe87ee25ef1c438e5696ac18e96b705c3e0c4e83cad734e9ba9eeecf3  clover-wifi-driver
+9e9d34d07ee3c403c8a8f4f521c8ca7add30dd969c1706f11f3a3aa9c69af4be4d0ba758cb37786606bec4e5f0d464100de6086927dd28679d610f83c8005021  deviceinfo
+77b78f53ff44c7917ff8dd06fd2e1d8038ae42063a232709546789a63e0e3d01d99940be8608b5afc3450f4206d42ec2491601267d5ce947c030666641a5b84b  modules-initfs.clover
+c43a8042826d3f32a9a73fd599914bec0c20af9b1f69faef7d778508d0d47ea89ce787294a9a42e89a4d29a9f47f23825fea9fc8ae06d4d9e34405237db114fa  modules-initfs.cloverplus
+4308178dd22bad0db0c64db65b137c78bf87f0e358fba759830127949c16af7a252dd8ba6e57604784c942e2d073d0c1a1e411133f307d4e13b5ffe1e3fd97cc  wifi-macaddr.sh
+a6a14430bf199fb74f7376f246362f3a8de267e5f7592e51875f89cb046f9f935762cbb373f7608629f0fbfbe1f82edebaa23c8b30629455a05cc64db0861831  xiaomi-clover-wlan-mac.service
+62e9619236c6db5cf4b56774188a8bdd9bf8a1bd928b2e70c770a67acf0e8a9d6a942f31676c25cde96ff8434c11df9c7ef6dfceea3309a847568d239515bb3e  xiaomi-clover-wlan-reset
 "

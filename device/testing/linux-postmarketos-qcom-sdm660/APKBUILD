@@ -1,85 +1,109 @@
-# Kernel config based on: arch/arm64/configs/sdm660_defconfig
-maintainer="Alexey Minnekhanov <alexeymin@postmarketos.org>"
+# Maintainer: Caleb Connolly <caleb@connolly.tech>
 _flavor="postmarketos-qcom-sdm660"
 pkgname=linux-$_flavor
-pkgver=6.17.4
-pkgrel=1
-pkgdesc="Close to mainline linux kernel for Qualcomm Snapdragon 660 SoC"
+pkgver=6.19.10
+pkgrel=4
+pkgdesc="Mainline kernel fork for Qualcomm SDM660 devices"
 arch="aarch64"
-url="https://kernel.org/"
+_carch="arm64"
+url="https://gitlab.com/sdm670-mainline/linux"
 license="GPL-2.0-only"
-options="!strip !check !tracedeps
-	pmb:cross-native
-	pmb:kconfigcheck-community
-	"
 makedepends="
 	bash
+	bc
 	bison
+	devicepkg-dev
 	findutils
 	flex
+	installkernel
+	kmod
 	openssl-dev
 	perl
-	postmarketos-installkernel
 	python3
+	samurai
 	zstd
 	"
+options="!strip !check !tracedeps pmb:cross-native"
 
-_tag="v$pkgver-sdm660"
-
+# Source
+_tag="v${pkgver}-sdm660"
+_config="config-$_flavor.$arch"
+_xiaomi_wlan_commit="728ac0be7512264ecdc3bf885a19c581c6890c17"
 source="
 	linux-$_tag.tar.gz::https://github.com/sdm660-mainline/linux/archive/refs/tags/$_tag.tar.gz
-	config-$_flavor.aarch64
+	$_config
+	xiaomi-wlan-$_xiaomi_wlan_commit.tar.gz::https://github.com/MiCode/vendor_qcom_opensource_wlan/archive/$_xiaomi_wlan_commit.tar.gz
+	0001-clover-icnss-platform-integration.patch
+	0002-xiaomi-qcacld-linux-6.19-port.patch
 "
-
-_carch="arm64"
-
-# for some reason, the directory inside .tar.gz does not match tag name: leading
-#     "v" is missing, so we can't use $_tag here
+# The archive directory omits the leading v from the tag.
 builddir="$srcdir/linux-$pkgver-sdm660"
+_outdir="out"
 
 prepare() {
+	# This vendor tree tracks a generated top-level .config. Remove it before
+	# out-of-tree builds; otherwise Kbuild aborts with "source tree is not clean".
+	rm -f .config
+
+	# Keep Xiaomi's matched 5.2 WLAN components as normal kernel sources.
+	# The Clover device package selects QCACLD at boot.
+	test ! -e "$builddir/drivers/staging/qcacld-3.0" || return 1
+	test ! -e "$builddir/drivers/staging/qca-wifi-host-cmn" || return 1
+	test ! -e "$builddir/drivers/staging/fw-api" || return 1
+	mkdir -p "$builddir/drivers/staging/qcacld-3.0" \
+		"$builddir/drivers/staging/qca-wifi-host-cmn" \
+		"$builddir/drivers/staging/fw-api"
+	local xiaomi_wlan="$srcdir/vendor_qcom_opensource_wlan-$_xiaomi_wlan_commit"
+	cp -a "$xiaomi_wlan/qcacld-3.0/." \
+		"$builddir/drivers/staging/qcacld-3.0/"
+	cp -a "$xiaomi_wlan/qca-wifi-host-cmn/." \
+		"$builddir/drivers/staging/qca-wifi-host-cmn/"
+	cp -a "$xiaomi_wlan/fw-api/." \
+		"$builddir/drivers/staging/fw-api/"
 	default_prepare
-	cp -v "$srcdir/config-$_flavor.$CARCH" "$builddir"/.config
+
+	mkdir -p "$_outdir"
+	cp "$srcdir/$_config" "$_outdir/.config"
 }
 
 build() {
 	unset LDFLAGS
-
-	make ARCH="$_carch" CC="${CC:-gcc}" \
-		KBUILD_BUILD_VERSION="$((pkgrel + 1 ))-$_flavor" all Image.gz
+	make O="$_outdir" ARCH="$_carch" CC="${CC:-gcc}" \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1 ))-$arch" \
+		CFLAGS_MODULE=-fno-pic \
+		DTC_FLAGS="-@"
 }
 
 package() {
 	mkdir -p "$pkgdir"/boot
-
-	make modules_install dtbs_install \
-		ARCH="$_carch" \
+	make O="$_outdir" ARCH="$_carch" \
 		INSTALL_PATH="$pkgdir"/boot \
 		INSTALL_MOD_PATH="$pkgdir" \
 		INSTALL_MOD_STRIP=1 \
-		INSTALL_DTBS_PATH="$pkgdir/boot/dtbs-tmp"
+		modules_install dtbs_install
 
-	install -D "$builddir/arch/arm64/boot/vmlinuz.efi" \
-		"$pkgdir/boot/vmlinuz.efi"
-
-	install -D "$builddir/arch/arm64/boot/Image.gz" \
-		"$pkgdir/boot/vmlinuz"
-
-	# Reduce package size, install only qcom SDM630/636/660 dtbs.
-	# This reduces .apk size from ~46 Mb to ~30 Mb.
-	mkdir -p "$pkgdir"/boot/dtbs/qcom
-	cp -r "$pkgdir"/boot/dtbs-tmp/qcom/sda660* "$pkgdir"/boot/dtbs/qcom
-	cp -r "$pkgdir"/boot/dtbs-tmp/qcom/sdm630* "$pkgdir"/boot/dtbs/qcom
-	cp -r "$pkgdir"/boot/dtbs-tmp/qcom/sdm636* "$pkgdir"/boot/dtbs/qcom
-	cp -r "$pkgdir"/boot/dtbs-tmp/qcom/sdm660* "$pkgdir"/boot/dtbs/qcom
-	rm -r "$pkgdir"/boot/dtbs-tmp
-
-	rm -f "$pkgdir"/lib/modules/*/build "$pkgdir"/lib/modules/*/source
-
-	install -D "$builddir/include/config/kernel.release" \
+	install -Dm644 "$builddir/$_outdir/include/config/kernel.release" \
 		"$pkgdir/usr/share/kernel/$_flavor/kernel.release"
+
+	local image
+	image="$(find "$builddir" -type f -path '*/arch/arm64/boot/Image.gz' -print -quit)"
+	if [ -z "$image" ]; then
+		image="$(find "$builddir" -type f -path '*/arch/arm64/boot/Image' -print -quit)"
+		[ -n "$image" ] || return 1
+		gzip -c "$image" > "$pkgdir/boot/vmlinuz-$_flavor"
+	else
+		install -Dm644 "$image" "$pkgdir/boot/vmlinuz-$_flavor"
+	fi
+	install -Dm644 "$srcdir/$_config" \
+		"$pkgdir/boot/config-$_flavor"
+	install -Dm644 "$(find "$builddir" -type f -name System.map -print -quit)" \
+		"$pkgdir/boot/System.map-$_flavor"
 }
+
 sha512sums="
-27b33c08162ff76f29095641b3913f61f301728eb3d341be4d8e03614a136783a7ee79842154614d11c76a84a06c6f2f0014f0ffeb378f7cd760e5e6fe138a88  linux-v6.17.4-sdm660.tar.gz
-dcc2a71ec15550718572c4af0b8faf137f8e761028ef3872ad732e28f7720b6bdf216f33fbe33ca859a83f5721fe3e26bcfbccfbbdeec23a6d571f745bae7543  config-postmarketos-qcom-sdm660.aarch64
+abf0ec97c2530ad3543a64019cefde3396c3361d7550513bf17948c6f4bf2621d88bb1947a519e8bddc97f1c6fdc7d12989cc8292a41805acac9f8f16f7a14df  linux-v6.19.10-sdm660.tar.gz
+4e299d83540f777093d67f85dab2fb38202c29bd358b1f1be59a35bfafddc1d152ec8edb8f594dbdd92880edaa905297ad5e0c543fc9928bab8dbf7db85d1336  config-postmarketos-qcom-sdm660.aarch64
+d98c8aebb17b6eaf8ee9f69e0aa847989b64d88814d7df0709777f104cf25f72b57d189991c05e691ac9893a6ce353aa6500a5383a811886d0c21c184bd84131  xiaomi-wlan-728ac0be7512264ecdc3bf885a19c581c6890c17.tar.gz
+0cdb48397e003388fa0a52b8293818992303203f956662c88fbdbb2c4d290362d248b0f9473e9bf5e6cce87460eca9bd58047903dac6bcaa9c5c19fd822f2c25  0001-clover-icnss-platform-integration.patch
+3e580ead51e871a9d915285f0726f8079cdd45683d2052f80a52b4e8fb81ed4afc43babc76344bfaeb5dee432895769118607a6039d00ff793d47b38bce4d0b5  0002-xiaomi-qcacld-linux-6.19-port.patch
 "

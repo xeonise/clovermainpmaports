@@ -1,0 +1,500 @@
+#!/bin/sh
+set -eu
+
+driver_name=clover-wifi-driver
+qcacld_conf=${CLOVER_QCACLD_CONF:-/etc/modprobe.d/90-xiaomi-clover-qcacld.conf}
+qcacld_load=${CLOVER_QCACLD_LOAD:-/etc/modules-load.d/90-xiaomi-clover-qcacld.conf}
+icnss_module=qcom-icnss-clover
+wifi_device=${CLOVER_WIFI_DEVICE:-/sys/bus/platform/devices/18800000.wifi}
+remoteproc_class=${CLOVER_REMOTEPROC_CLASS:-/sys/class/remoteproc}
+proc_modules=${CLOVER_PROC_MODULES:-/proc/modules}
+run_dir=${CLOVER_RUN_DIR:-/run/clover-wifi-driver}
+
+log()
+{
+	printf '%s: %s\n' "$driver_name" "$*" >&2
+}
+
+require_root()
+{
+	if [ "$(id -u)" -ne 0 ]; then
+		log "run as root"
+		exit 1
+	fi
+}
+
+have_module()
+{
+	modinfo -k "$(uname -r)" "$1" >/dev/null 2>&1
+}
+
+module_loaded()
+{
+	module_name=$(printf '%s' "$1" | tr '-' '_')
+	grep -q "^$module_name " "$proc_modules"
+}
+
+network_manager()
+{
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl "$1" NetworkManager.service 2>/dev/null || true
+	fi
+}
+
+bound_driver()
+{
+	if [ -L "$wifi_device/driver" ]; then
+		basename "$(readlink -f "$wifi_device/driver")"
+	else
+		printf 'none\n'
+	fi
+}
+
+icnss_attr()
+{
+	attr=$1
+	if [ -r "$wifi_device/$attr" ]; then
+		cat "$wifi_device/$attr"
+	else
+		printf 'unavailable\n'
+	fi
+}
+
+fault_count()
+{
+	dmesg 2>/dev/null | grep -Eic \
+		'firmware crashed|fatal error received|whal_tracer|WLAN RT:.*assert|Assign memory protection call failed|failed to assign MSA region' || true
+}
+
+recovery_generation()
+{
+	value=$(icnss_attr recovery_generation)
+	case "$value" in
+	''|*[!0-9]*) printf '0\n' ;;
+	*) printf '%s\n' "$value" ;;
+	esac
+}
+
+record_attempt()
+{
+	mkdir -p "$run_dir"
+	fault_count >"$run_dir/attempt-fault-count"
+	recovery_generation >"$run_dir/attempt-recovery-generation"
+}
+
+attempt_fault_baseline()
+{
+	if [ -r "$run_dir/attempt-fault-count" ]; then
+		cat "$run_dir/attempt-fault-count"
+	else
+		fault_count
+	fi
+}
+
+refresh_fault_baseline()
+{
+	fault_count >"$run_dir/attempt-fault-count"
+}
+
+fault_since()
+{
+	baseline=$1
+	current=$(fault_count)
+	[ "$current" -gt "$baseline" ]
+}
+
+find_wlan_remoteproc()
+{
+	for remoteproc in "$remoteproc_class"/remoteproc*; do
+		[ -r "$remoteproc/name" ] || continue
+		if grep -Eqi '(^|/)4080000\.remoteproc$|wcnss|wlan' \
+			"$remoteproc/name"; then
+			printf '%s\n' "$remoteproc"
+			return 0
+		fi
+	done
+	return 1
+}
+
+remoteproc_running()
+{
+	remoteproc=$(find_wlan_remoteproc) || return 1
+	[ "$(cat "$remoteproc/state" 2>/dev/null || true)" = running ]
+}
+
+wait_for_remoteproc()
+{
+	waited=0
+	while [ "$waited" -lt 45 ]; do
+		remoteproc_running && return 0
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+restart_wlan_remoteproc()
+{
+	remoteproc=$(find_wlan_remoteproc) || {
+		log "WLAN remoteproc was not found"
+		return 1
+	}
+	state=$(cat "$remoteproc/state" 2>/dev/null || true)
+	if [ "$state" = running ]; then
+		printf 'stop\n' >"$remoteproc/state" || return 1
+		waited=0
+		while [ "$waited" -lt 15 ]; do
+			[ "$(cat "$remoteproc/state" 2>/dev/null || true)" != running ] && break
+			sleep 1
+			waited=$((waited + 1))
+		done
+		[ "$(cat "$remoteproc/state" 2>/dev/null || true)" != running ] || {
+			log "WLAN remoteproc did not stop"
+			return 1
+		}
+	fi
+	printf 'start\n' >"$remoteproc/state" || return 1
+	wait_for_remoteproc
+}
+
+wait_for_icnss_firmware()
+{
+	waited=0
+	while [ "$waited" -lt 45 ]; do
+		case "$(icnss_attr recovery_state)" in
+		firmware-ready|ready) return 0 ;;
+		failed) return 1 ;;
+		esac
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+wait_for_qcacld()
+{
+	waited=0
+	while [ "$waited" -lt 45 ]; do
+		if [ "$(icnss_attr recovery_state)" = ready ] &&
+			[ "$(bound_driver)" = icnss-clover ] &&
+			ip link show wlan0 >/dev/null 2>&1; then
+			return 0
+		fi
+		[ "$(icnss_attr recovery_state)" != failed ] || return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+wait_for_recovery()
+{
+	baseline_generation=$1
+	waited=0
+	while [ "$waited" -lt 60 ]; do
+		generation=$(recovery_generation)
+		if [ "$generation" -gt "$baseline_generation" ] &&
+			[ "$(icnss_attr recovery_state)" = ready ] &&
+			remoteproc_running &&
+			ip link show wlan0 >/dev/null 2>&1; then
+			return 0
+		fi
+		[ "$(icnss_attr recovery_state)" != failed ] || return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+module_vermagic_matches_running_kernel()
+{
+	vermagic=$(modinfo -F vermagic "$1" 2>/dev/null || true)
+	case "$vermagic" in
+	"$(uname -r)"\ *) return 0 ;;
+	esac
+	return 1
+}
+
+validate_candidate()
+{
+	module_path=$1
+	expected_name=$2
+	case "$module_path" in
+	/*) ;;
+	*) log "candidate module path must be absolute: $module_path"; return 1 ;;
+	esac
+	[ -f "$module_path" ] || {
+		log "candidate module is not a regular file: $module_path"
+		return 1
+	}
+	module_vermagic_matches_running_kernel "$module_path" || {
+		log "candidate vermagic does not match $(uname -r): $module_path"
+		return 1
+	}
+	actual_name=$(modinfo -F name "$module_path" 2>/dev/null | tr '_' '-')
+	[ "$actual_name" = "$expected_name" ] || {
+		log "expected module $expected_name, found ${actual_name:-unknown}"
+		return 1
+	}
+}
+
+validate_wlan_dependency()
+{
+	depends=$(modinfo -F depends "$1" 2>/dev/null | tr '_' '-')
+	case ",$depends," in
+	*,qcom-icnss-clover,*) return 0 ;;
+	esac
+	log "wlan candidate does not depend on qcom-icnss-clover"
+	return 1
+}
+
+save_loaded_wlan()
+{
+	loaded_path=$(modinfo -n wlan 2>/dev/null || true)
+	[ -n "$loaded_path" ] && [ -r "$loaded_path" ] || return 1
+	mkdir -p "$run_dir"
+	case "$loaded_path" in
+	*.zst)
+		command -v zstd >/dev/null 2>&1 || return 1
+		zstd -q -d -f "$loaded_path" -o "$run_dir/previous-wlan.ko"
+		;;
+	*) cp "$loaded_path" "$run_dir/previous-wlan.ko" ;;
+	esac
+	validate_candidate "$run_dir/previous-wlan.ko" wlan
+}
+
+restore_ath10k_clean()
+{
+	baseline=$1
+	if fault_since "$baseline"; then
+		log "firmware fault detected; refusing an unsafe ath10k rollback"
+		return 1
+	fi
+	modprobe -r wlan 2>/dev/null || true
+	modprobe -r "$icnss_module" 2>/dev/null || true
+	if fault_since "$baseline"; then
+		wait_for_remoteproc || true
+		log "firmware fault occurred during teardown; reboot required"
+		return 1
+	fi
+	modprobe ath10k_snoc
+	network_manager start
+}
+
+qcacld_milestones()
+{
+	baseline=$(attempt_fault_baseline)
+	current=$(fault_count)
+	printf 'kernel=%s\n' "$(uname -r)"
+	printf 'platform_driver=%s\n' "$(bound_driver)"
+	printf 'qcacld_loaded=%s\n' "$(module_loaded wlan && echo yes || echo no)"
+	printf 'wlan0=%s\n' "$(ip link show wlan0 >/dev/null 2>&1 && echo present || echo absent)"
+	printf 'icnss_state=%s\n' "$(icnss_attr recovery_state)"
+	printf 'icnss_recovery_generation=%s\n' "$(icnss_attr recovery_generation)"
+	printf 'icnss_last_error=%s\n' "$(icnss_attr last_error)"
+	printf 'icnss_msa_owner=%s\n' "$(icnss_attr msa_owner)"
+	if command -v iw >/dev/null 2>&1 && ip link show wlan0 >/dev/null 2>&1; then
+		printf 'association=%s\n' "$(iw dev wlan0 link 2>/dev/null | grep -q '^Connected to ' && echo yes || echo no)"
+	else
+		printf 'association=unknown\n'
+	fi
+	printf 'ipv4_lease=%s\n' "$(ip -4 addr show dev wlan0 2>/dev/null | grep -q 'inet ' && echo yes || echo no)"
+	printf 'default_route=%s\n' "$(ip route get 1.1.1.1 2>/dev/null | grep -q 'dev wlan0' && echo yes || echo no)"
+	printf 'key_trace_records=%s\n' "$(dmesg 2>/dev/null | grep -c 'CLOVER_KEY_TRACE' || true)"
+	printf 'tx_trace_records=%s\n' "$(dmesg 2>/dev/null | grep -c 'CLOVER_TX_TRACE' || true)"
+	printf 'firmware_faults_since_attempt=%s\n' "$((current - baseline))"
+}
+
+status()
+{
+	printf 'kernel=%s\n' "$(uname -r)"
+	if [ -r /sys/class/net/wlan0/device/driver/module ]; then
+		printf 'wlan_driver=%s\n' "$(basename "$(readlink -f /sys/class/net/wlan0/device/driver/module)")"
+	else
+		printf 'wlan_driver=none\n'
+	fi
+	printf 'platform_driver=%s\n' "$(bound_driver)"
+	printf 'icnss_state=%s\n' "$(icnss_attr recovery_state)"
+	printf 'icnss_msa_owner=%s\n' "$(icnss_attr msa_owner)"
+	printf 'ath10k_snoc=%s\n' "$(have_module ath10k_snoc && echo available || echo missing)"
+	printf 'qcacld_icnss=%s\n' "$(have_module "$icnss_module" && echo available || echo missing)"
+	printf 'qcacld_wlan=%s\n' "$(have_module wlan && echo available || echo missing)"
+	printf 'default=%s\n' "$([ -f "$qcacld_conf" ] && echo qcacld || echo ath10k)"
+}
+
+handoff_from_ath10k()
+{
+	baseline=$1
+	settle_seconds=${CLOVER_RECOVERY_SETTLE_SECONDS:-5}
+	modprobe -r wlan "$icnss_module" 2>/dev/null || true
+	modprobe -r ath10k_snoc ath10k_core 2>/dev/null || {
+		log "could not unload ath10k_snoc; refusing a dual-driver bind"
+		return 1
+	}
+	if fault_since "$baseline"; then
+		if ! wait_for_remoteproc; then
+			log "ath10k handoff fault did not recover; reboot required"
+			return 1
+		fi
+		# remoteproc reports running before all post-crash WLFW services are
+		# necessarily ready to accept their first QMI transaction.
+		sleep "$settle_seconds"
+		log "ath10k handoff firmware fault recovered"
+	fi
+}
+
+try_qcacld_modules()
+{
+	icnss_path=${1:-}
+	wlan_path=${2:-}
+	validate_candidate "$icnss_path" qcom-icnss-clover || exit 2
+	validate_candidate "$wlan_path" wlan || exit 2
+	validate_wlan_dependency "$wlan_path" || exit 2
+
+	record_attempt
+	baseline=$(attempt_fault_baseline)
+	handoff_from_ath10k "$baseline" || {
+		network_manager start
+		exit 1
+	}
+	# Unbind ath10k while it can still shut WLAN down cleanly.  Stopping
+	# NetworkManager first can deauthenticate the last interface and make the
+	# ath10k firmware assert before its remove callback sends WLAN_MODE_OFF.
+	network_manager stop
+	# A recovered fault caused by shutting down ath10k belongs to the
+	# handoff, not to the candidate stack being evaluated below.
+	refresh_fault_baseline
+	baseline=$(attempt_fault_baseline)
+	if ! insmod "$icnss_path" || ! restart_wlan_remoteproc ||
+		! wait_for_icnss_firmware; then
+		log "candidate ICNSS did not reach firmware-ready"
+		restore_ath10k_clean "$baseline" || log "reboot required before another driver trial"
+		exit 1
+	fi
+	if ! insmod "$wlan_path" || ! wait_for_qcacld; then
+		log "candidate qcacld did not reach ready"
+		if fault_since "$baseline"; then
+			generation=$(cat "$run_dir/attempt-recovery-generation")
+			if wait_for_recovery "$generation"; then
+				network_manager start
+				log "firmware recovered and candidate qcacld was reinitialized"
+				return 0
+			fi
+			log "recovery failed; reboot required"
+		else
+			restore_ath10k_clean "$baseline" || true
+		fi
+		exit 1
+	fi
+	network_manager start
+	log "candidate ICNSS and qcacld are active for this boot only"
+}
+
+try_qcacld()
+{
+	have_module wlan || { log "qcacld is not built for $(uname -r)"; exit 2; }
+	have_module "$icnss_module" || { log "ICNSS is not built for $(uname -r)"; exit 2; }
+	record_attempt
+	baseline=$(attempt_fault_baseline)
+	handoff_from_ath10k "$baseline" || { network_manager start; exit 1; }
+	network_manager stop
+	refresh_fault_baseline
+	baseline=$(attempt_fault_baseline)
+	if ! modprobe "$icnss_module" || ! restart_wlan_remoteproc ||
+		! wait_for_icnss_firmware ||
+		! modprobe wlan || ! wait_for_qcacld; then
+		log "installed qcacld stack did not become ready"
+		restore_ath10k_clean "$baseline" || log "reboot required before another driver trial"
+		exit 1
+	fi
+	network_manager start
+	log "qcacld is active for this boot only"
+}
+
+reload_qcacld()
+{
+	module_path=${1:-}
+	validate_candidate "$module_path" wlan || exit 2
+	validate_wlan_dependency "$module_path" || exit 2
+	[ "$(bound_driver)" = icnss-clover ] && module_loaded "$icnss_module" &&
+		[ "$(icnss_attr recovery_state)" = ready ] || {
+		log "reload requires a healthy ICNSS/qcacld session"
+		exit 1
+	}
+	module_loaded wlan || { log "wlan is not loaded"; exit 1; }
+	save_loaded_wlan || { log "could not preserve wlan.ko for rollback"; exit 1; }
+
+	record_attempt
+	baseline=$(attempt_fault_baseline)
+	generation=$(recovery_generation)
+	network_manager stop
+	ip link set wlan0 down 2>/dev/null || true
+	modprobe -r wlan || { log "qcacld unload failed"; network_manager start; exit 1; }
+	[ "$(bound_driver)" = icnss-clover ] || {
+		log "ICNSS unexpectedly unbound; reboot required"
+		exit 1
+	}
+	if ! insmod "$module_path"; then
+		if fault_since "$baseline"; then
+			log "candidate load faulted firmware; reboot required"
+			exit 1
+		fi
+		log "candidate load failed; restoring preserved wlan.ko"
+		insmod "$run_dir/previous-wlan.ko" && wait_for_qcacld || {
+			log "rollback failed; reboot required"
+			exit 1
+		}
+		network_manager start
+		exit 1
+	fi
+	if ! wait_for_qcacld; then
+		if fault_since "$baseline" && wait_for_recovery "$generation"; then
+			log "firmware recovered and candidate qcacld was reinitialized"
+		else
+			log "candidate did not recover; reboot required"
+			exit 1
+		fi
+	fi
+	network_manager start
+	log "candidate qcacld loaded; run qcacld-milestones after association"
+}
+
+use_qcacld()
+{
+	try_qcacld
+	install -d /etc/modprobe.d /etc/modules-load.d
+	cat >"$qcacld_conf" <<'EOF'
+# Generated by clover-wifi-driver use-qcacld
+# WCN3990 has one platform client; qcacld and ath10k must not bind together.
+blacklist ath10k_snoc
+EOF
+	printf '%s\n' wlan >"$qcacld_load"
+	log "qcacld selected for future boots; use-ath10k rolls this back"
+}
+
+use_ath10k()
+{
+	rm -f "$qcacld_conf" "$qcacld_load"
+	record_attempt
+	baseline=$(attempt_fault_baseline)
+	network_manager stop
+	restore_ath10k_clean "$baseline" || {
+		log "ath10k remains the boot default, but a reboot is required to activate it"
+		exit 1
+	}
+	log "ath10k restored as the default driver"
+}
+
+case "${1:-status}" in
+status) status ;;
+try-qcacld) require_root; try_qcacld ;;
+try-qcacld-modules) require_root; try_qcacld_modules "${2:-}" "${3:-}" ;;
+reload-qcacld) require_root; reload_qcacld "${2:-}" ;;
+qcacld-milestones) qcacld_milestones ;;
+use-qcacld) require_root; use_qcacld ;;
+use-ath10k) require_root; use_ath10k ;;
+*)
+	echo "usage: $0 {status|try-qcacld|try-qcacld-modules /absolute/qcom-icnss-clover.ko /absolute/wlan.ko|reload-qcacld /absolute/wlan.ko|qcacld-milestones|use-qcacld|use-ath10k}" >&2
+	exit 2
+	;;
+esac

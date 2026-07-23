@@ -1,0 +1,9 @@
+[Unit]
+Description=Set Xiaomi Clover WLAN factory MAC address
+BindsTo=sys-subsystem-net-devices-wlan0.device
+After=sys-subsystem-net-devices-wlan0.device
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/device-xiaomi-clover/wifi-macaddr.sh

@@ -1,0 +1,5290 @@
+# Zxk <lineag896@gmail.com>
+# Clover WCN3990 ICNSS 
+#
+# clover-only icnss work:
+# - describes the two WLAN 3.3 V rails and stable device MAC;
+# - adds the ICNSS compatibility ABI and explicit module wiring;
+# - implements WLFW/athdiag, MSA, board-data, calibration, recovery, and
+#   firmware-ready sequencing used by the QCACLD client;
+# - keeps the WLAN transport explicit-load only so other SDM660 devices do
+#   not bind this client automatically.
+#
+# functions:
+# - icnss_clover_probe/remove: create and tear down the Clover platform client.
+# - icnss_server_work: sequence QMI service registration and firmware readiness.
+# - ICNSS board/calibration helpers: transfer BDF data and report calibration.
+# - recovery/PM helpers: preserve ownership and power across restart/suspend.
+#diff --git a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
+index 43bef7707d10ce30ef9138b9d439b47af1c0ec09..a12dea5687cb54d67c67aad094a780fbf7fb8380 100644
+--- a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
+@@ -758,6 +758,8 @@ &wifi {
+ 	vdd-1.8-xo-supply = <&vreg_l9a_1p8>;
+ 	vdd-1.3-rfa-supply = <&vreg_l6a_1p3>;
+ 	vdd-3.3-ch0-supply = <&vreg_l19a_3p3>;
++	vdd-3.3-ch1-supply = <&vreg_l19a_3p3>;
++	local-mac-address = [d8 32 e3 06 a5 d7];
+ 
+ 	status = "okay";
+ };
+diff --git a/drivers/staging/Kconfig b/drivers/staging/Kconfig
+index 2f92cd698bef6d501702dad7413a6fc5b42071b4..69c66bc63c748b4bca7c7b2e91891f9ad4465131 100644
+--- a/drivers/staging/Kconfig
++++ b/drivers/staging/Kconfig
+@@ -48,4 +48,5 @@ source "drivers/staging/axis-fifo/Kconfig"
+ 
+ source "drivers/staging/vme_user/Kconfig"
+ 
++source "drivers/staging/qcom_icnss_clover/Kconfig"
+ endif # STAGING
+diff --git a/drivers/staging/Makefile b/drivers/staging/Makefile
+index f5b8876aa536fdd5afcf8214eaf148ed2c100bb6..b54f3ca014198d116635f67097bf522c98337a6a 100644
+--- a/drivers/staging/Makefile
++++ b/drivers/staging/Makefile
+@@ -13,3 +13,5 @@ obj-$(CONFIG_MOST)		+= most/
+ obj-$(CONFIG_GREYBUS)		+= greybus/
+ obj-$(CONFIG_BCM2835_VCHIQ)	+= vc04_services/
+ obj-$(CONFIG_XIL_AXIS_FIFO)	+= axis-fifo/
++obj-$(CONFIG_ICNSS)		+= qcom_icnss_clover/
++obj-$(CONFIG_QCA_CLD_WLAN)	+= qcacld-3.0/
+diff --git a/drivers/staging/qcom_icnss_clover/Kconfig b/drivers/staging/qcom_icnss_clover/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fdfb51eaf68b17f352e4e34567ca32a5de8100f
+--- /dev/null
++++ b/drivers/staging/qcom_icnss_clover/Kconfig
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config ICNSS
++	tristate "Qualcomm WCN3990 ICNSS backend for Clover qcacld"
++	depends on ARCH_QCOM
++	depends on NET
++	select QCOM_SCM
++	select QCOM_QMI_HELPERS
++	help
++	  Bind Clover's WCN3990 platform device, bring up the WLFW QMI
++	  service and MSA permissions, expose the twelve copy-engine IRQs,
++	  and provide the legacy ICNSS client ABI used by Xiaomi qcacld-3.0.
++
++	  Build this as a module so ath10k_snoc remains an unloadable
++	  fallback during bring-up.
++
++config QCA_CLD_WLAN
++	tristate "Qualcomm Atheros CLD WLAN module"
++	depends on ICNSS
++	depends on CFG80211
++	select WIRELESS_EXT
++	select WEXT_PRIV
++	help
++	  Build Xiaomi's qcacld-3.0 WLAN module for the WCN3990 SNOC bus.
+diff --git a/drivers/staging/qcom_icnss_clover/Makefile b/drivers/staging/qcom_icnss_clover/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..01d47a1624903ce82f057af90fba8ff59599eadc
+--- /dev/null
++++ b/drivers/staging/qcom_icnss_clover/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_ICNSS) += qcom-icnss-clover.o
++qcom-icnss-clover-y := icnss_clover.o wlan_firmware_service_v01.o
+diff --git a/drivers/staging/qcom_icnss_clover/icnss_clover.c b/drivers/staging/qcom_icnss_clover/icnss_clover.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7c1a1e25383b309fc89004f523f04b3f1468233
+--- /dev/null
++++ b/drivers/staging/qcom_icnss_clover/icnss_clover.c
+@@ -0,0 +1,2031 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ICNSS/WLFW backend for the WCN3990 in Xiaomi Clover.
++ *
++ * The wire protocol is the upstream WLFW
++ * v01 schema used by ath10k_snoc on the same hardware.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/etherdevice.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/irqdomain.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of_irq.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/qrtr.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++#include <linux/soc/qcom/qmi.h>
++#include <linux/firmware/qcom/qcom_scm.h>
++#include <net/sock.h>
++#include <soc/qcom/icnss.h>
++
++#include "wlan_firmware_service_v01.h"
++
++#define ICNSS_WLFW_CLIENT_ID		0x4b4e454c
++#define ICNSS_WLFW_TIMEOUT		30
++#define ICNSS_BDF_FILE			"ath10k/WCN3990/hw1.0/bdwlan.bin"
++#define ICNSS_MSA_SIZE			0x100000
++#define ICNSS_MAX_MEM_REGIONS		2
++#define ICNSS_MAX_UNSAFE_CHANNELS	64
++
++struct icnss_mem_region {
++	phys_addr_t addr;
++	u32 size;
++	bool secure;
++	enum {
++		ICNSS_MSA_OWNER_HLOS,
++		ICNSS_MSA_OWNER_WLAN,
++		ICNSS_MSA_OWNER_FIXED,
++	} owner;
++};
++
++enum icnss_recovery_state {
++	ICNSS_RECOVERY_INACTIVE,
++	ICNSS_RECOVERY_INITIALIZING,
++	ICNSS_RECOVERY_FW_READY,
++	ICNSS_RECOVERY_RECOVERING,
++	ICNSS_RECOVERY_READY,
++	ICNSS_RECOVERY_FAILED,
++};
++
++struct icnss_ce_irq {
++	int irq;
++	void *ctx;
++	bool requested;
++};
++
++struct icnss_clover {
++	struct device *dev;
++	struct mutex lock;
++	struct icnss_driver_ops *ops;
++
++	void __iomem *mem_base;
++	phys_addr_t mem_base_pa;
++	struct icnss_ce_irq ce[ICNSS_MAX_IRQ_REGISTRATIONS];
++
++	struct regulator_bulk_data vregs[5];
++	struct clk_bulk_data clks[2];
++	bool powered;
++
++	void *msa_va;
++	phys_addr_t msa_pa;
++	size_t msa_size;
++	struct icnss_mem_region mem_region[ICNSS_MAX_MEM_REGIONS];
++	u32 nr_mem_region;
++	bool msa_fixed_perm;
++	bool msa_layout_valid;
++	bool msa_adopted;
++
++	struct qmi_handle qmi;
++	struct sockaddr_qrtr sq;
++	struct workqueue_struct *wq;
++	struct work_struct server_work;
++	struct work_struct bdf_work;
++	struct work_struct fw_ready_work;
++	struct work_struct server_exit_work;
++	bool qmi_initialized;
++	bool qmi_connected;
++	bool removing;
++	bool fw_ready;
++	bool msa_ready;
++
++	struct icnss_driver_ops *active_ops;
++	bool driver_probed;
++	bool recovering;
++	enum icnss_recovery_state recovery_state;
++	u32 recovery_generation;
++	int last_error;
++
++	struct icnss_soc_info soc;
++	u8 mac_addr[ETH_ALEN];
++	u16 unsafe_channels[ICNSS_MAX_UNSAFE_CHANNELS];
++	u16 unsafe_channel_count;
++	void *dfs_nol;
++	u16 dfs_nol_len;
++};
++
++static DEFINE_MUTEX(icnss_global_lock);
++static struct icnss_clover *icnss_global;
++static atomic_t icnss_driver_load_count = ATOMIC_INIT(0);
++static enum cnss_cc_src icnss_cc_source = CNSS_SOURCE_CORE;
++
++static const char *icnss_recovery_state_name(enum icnss_recovery_state state)
++{
++	switch (state) {
++	case ICNSS_RECOVERY_INACTIVE:
++		return "inactive";
++	case ICNSS_RECOVERY_INITIALIZING:
++		return "initializing";
++	case ICNSS_RECOVERY_FW_READY:
++		return "firmware-ready";
++	case ICNSS_RECOVERY_RECOVERING:
++		return "recovering";
++	case ICNSS_RECOVERY_READY:
++		return "ready";
++	case ICNSS_RECOVERY_FAILED:
++		return "failed";
++	}
++
++	return "unknown";
++}
++
++static bool icnss_msa_wlan_owned(struct icnss_clover *ic)
++{
++	bool owned = false;
++	int i;
++
++	mutex_lock(&ic->lock);
++	for (i = 0; i < ic->nr_mem_region; i++)
++		owned |= ic->mem_region[i].owner == ICNSS_MSA_OWNER_WLAN;
++	mutex_unlock(&ic->lock);
++
++	return owned;
++}
++
++static void icnss_set_failed(struct icnss_clover *ic, int error)
++{
++	mutex_lock(&ic->lock);
++	ic->last_error = error;
++	ic->recovery_state = ICNSS_RECOVERY_FAILED;
++	mutex_unlock(&ic->lock);
++}
++
++static void icnss_begin_recovery_locked(struct icnss_clover *ic)
++{
++	if (ic->recovery_state != ICNSS_RECOVERY_RECOVERING)
++		ic->recovery_generation++;
++	ic->recovery_state = ICNSS_RECOVERY_RECOVERING;
++	ic->last_error = 0;
++}
++
++static const char * const icnss_vreg_names[] = {
++	"vdd-0.8-cx-mx",
++	"vdd-1.8-xo",
++	"vdd-1.3-rfa",
++	"vdd-3.3-ch0",
++	"vdd-3.3-ch1",
++};
++
++static const char * const icnss_clk_names[] = {
++	"cxo_ref_clk_pin",
++	"qdss",
++};
++
++static struct icnss_clover *icnss_from_dev(struct device *dev)
++{
++	struct icnss_clover *ic;
++
++	mutex_lock(&icnss_global_lock);
++	ic = icnss_global;
++	if (ic && dev && dev != ic->dev)
++		ic = NULL;
++	mutex_unlock(&icnss_global_lock);
++
++	return ic;
++}
++
++static int icnss_result_to_errno(const struct qmi_response_type_v01 *resp)
++{
++	if (resp->result == QMI_RESULT_SUCCESS_V01)
++		return 0;
++
++	return resp->error == QMI_ERR_NOT_SUPPORTED_V01 ?
++		-EOPNOTSUPP : -EREMOTEIO;
++}
++
++static int icnss_qmi_result(struct icnss_clover *ic, const char *operation,
++			    const struct qmi_response_type_v01 *resp)
++{
++	int ret = icnss_result_to_errno(resp);
++
++	if (ret)
++		dev_err(ic->dev,
++			"WLFW %s rejected: result=%u error=%u mapped=%d\n",
++			operation, resp->result, resp->error, ret);
++
++	return ret;
++}
++
++static int icnss_hw_power_on(struct icnss_clover *ic)
++{
++	int ret;
++
++	mutex_lock(&ic->lock);
++	if (ic->powered) {
++		mutex_unlock(&ic->lock);
++		return 0;
++	}
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(ic->vregs), ic->vregs);
++	if (ret)
++		goto out;
++
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(ic->clks), ic->clks);
++	if (ret) {
++		regulator_bulk_disable(ARRAY_SIZE(ic->vregs), ic->vregs);
++		goto out;
++	}
++
++	ic->powered = true;
++out:
++	mutex_unlock(&ic->lock);
++	return ret;
++}
++
++static int icnss_hw_power_off(struct icnss_clover *ic)
++{
++	int ret = 0;
++
++	mutex_lock(&ic->lock);
++	if (!ic->powered)
++		goto out;
++
++	clk_bulk_disable_unprepare(ARRAY_SIZE(ic->clks), ic->clks);
++	ret = regulator_bulk_disable(ARRAY_SIZE(ic->vregs), ic->vregs);
++	ic->powered = false;
++out:
++	mutex_unlock(&ic->lock);
++	return ret;
++}
++
++static int icnss_assign_one_region(struct icnss_clover *ic,
++				   struct icnss_mem_region *region)
++{
++	struct qcom_scm_vmperm dst[3];
++	u64 src = BIT(QCOM_SCM_VMID_HLOS);
++	unsigned int count = 2;
++	int ret;
++
++	dst[0].vmid = QCOM_SCM_VMID_MSS_MSA;
++	dst[0].perm = QCOM_SCM_PERM_RW;
++	dst[1].vmid = QCOM_SCM_VMID_WLAN;
++	dst[1].perm = QCOM_SCM_PERM_RW;
++	if (!region->secure) {
++		dst[2].vmid = QCOM_SCM_VMID_WLAN_CE;
++		dst[2].perm = QCOM_SCM_PERM_RW;
++		count = 3;
++	}
++
++	ret = qcom_scm_assign_mem(region->addr, region->size, &src, dst, count);
++	if (ret)
++		dev_err(ic->dev, "failed to assign MSA region: %d\n", ret);
++	return ret;
++}
++
++static int icnss_unassign_one_region(struct icnss_clover *ic,
++				     struct icnss_mem_region *region)
++{
++	struct qcom_scm_vmperm dst = {
++		.vmid = QCOM_SCM_VMID_HLOS,
++		.perm = QCOM_SCM_PERM_RW,
++	};
++	u64 src = BIT(QCOM_SCM_VMID_MSS_MSA) | BIT(QCOM_SCM_VMID_WLAN);
++
++	if (!region->secure)
++		src |= BIT(QCOM_SCM_VMID_WLAN_CE);
++
++	return qcom_scm_assign_mem(region->addr, region->size, &src, &dst, 1);
++}
++
++static int icnss_assign_msa(struct icnss_clover *ic)
++{
++	bool newly_assigned[ICNSS_MAX_MEM_REGIONS] = {};
++	bool wlan_owned;
++	int assign_error;
++	int i;
++	int ret;
++
++	if (ic->msa_fixed_perm)
++		return 0;
++
++	for (i = 0; i < ic->nr_mem_region; i++) {
++		mutex_lock(&ic->lock);
++		wlan_owned = ic->mem_region[i].owner == ICNSS_MSA_OWNER_WLAN;
++		mutex_unlock(&ic->lock);
++		if (wlan_owned)
++			continue;
++		ret = icnss_assign_one_region(ic, &ic->mem_region[i]);
++		if (ret)
++			goto unwind;
++		mutex_lock(&ic->lock);
++		ic->mem_region[i].owner = ICNSS_MSA_OWNER_WLAN;
++		mutex_unlock(&ic->lock);
++		newly_assigned[i] = true;
++	}
++	return 0;
++
++unwind:
++	assign_error = ret;
++	while (--i >= 0) {
++		if (!newly_assigned[i])
++			continue;
++		if (!icnss_unassign_one_region(ic, &ic->mem_region[i])) {
++			mutex_lock(&ic->lock);
++			ic->mem_region[i].owner = ICNSS_MSA_OWNER_HLOS;
++			mutex_unlock(&ic->lock);
++		}
++	}
++	return assign_error;
++}
++
++static int icnss_unassign_msa(struct icnss_clover *ic)
++{
++	int first_error = 0;
++	int i;
++	int ret;
++
++	if (ic->msa_fixed_perm)
++		return 0;
++
++	for (i = 0; i < ic->nr_mem_region; i++) {
++		mutex_lock(&ic->lock);
++		ret = ic->mem_region[i].owner == ICNSS_MSA_OWNER_WLAN;
++		mutex_unlock(&ic->lock);
++		if (!ret)
++			continue;
++		ret = icnss_unassign_one_region(ic, &ic->mem_region[i]);
++		if (ret) {
++			if (!first_error)
++				first_error = ret;
++			dev_err(ic->dev,
++				"failed to return MSA region %d to HLOS: %d\n",
++				i, ret);
++			continue;
++		}
++		mutex_lock(&ic->lock);
++		ic->mem_region[i].owner = ICNSS_MSA_OWNER_HLOS;
++		mutex_unlock(&ic->lock);
++	}
++
++	return first_error;
++}
++
++static int icnss_qmi_ind_register(struct icnss_clover *ic)
++{
++	struct wlfw_ind_register_resp_msg_v01 resp = {};
++	struct wlfw_ind_register_req_msg_v01 req = {};
++	struct qmi_txn txn;
++	int ret;
++
++	req.client_id_valid = 1;
++	req.client_id = ICNSS_WLFW_CLIENT_ID;
++	req.fw_ready_enable_valid = 1;
++	req.fw_ready_enable = 1;
++	req.msa_ready_enable_valid = 1;
++	req.msa_ready_enable = 1;
++
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_ind_register_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_IND_REGISTER_REQ_V01,
++			       WLFW_IND_REGISTER_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_ind_register_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret < 0)
++		return ret;
++	ret = icnss_qmi_result(ic, "ind-register", &resp.resp);
++	if (!ret)
++		dev_info(ic->dev,
++			 "WLFW ind-register status: valid=%u status=0x%llx\n",
++			 resp.fw_status_valid, resp.fw_status);
++	if (!ret && resp.fw_status_valid) {
++		mutex_lock(&ic->lock);
++		if (resp.fw_status & QMI_WLFW_FW_READY_V01)
++			ic->fw_ready = true;
++		if (resp.fw_status & QMI_WLFW_MSA_READY_V01)
++			ic->msa_ready = true;
++		if ((resp.fw_status & (QMI_WLFW_ALREADY_REGISTERED_V01 |
++				       QMI_WLFW_FW_READY_V01)) &&
++		    !ic->msa_fixed_perm && !ic->msa_layout_valid)
++			ic->msa_adopted = true;
++		mutex_unlock(&ic->lock);
++	}
++	return ret;
++}
++
++static int icnss_qmi_host_cap(struct icnss_clover *ic)
++{
++	struct wlfw_host_cap_resp_msg_v01 resp = {};
++	struct wlfw_host_cap_req_msg_v01 req = {};
++	const struct qmi_elem_info *req_ei;
++	struct qmi_txn txn;
++	int ret;
++
++	req.daemon_support_valid = 1;
++	req.daemon_support = 0;
++	req_ei = device_property_read_bool(ic->dev,
++					   "qcom,snoc-host-cap-8bit-quirk") ?
++		wlfw_host_cap_8bit_req_msg_v01_ei :
++		wlfw_host_cap_req_msg_v01_ei;
++
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_host_cap_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_HOST_CAP_REQ_V01,
++			       WLFW_HOST_CAP_REQ_MSG_V01_MAX_MSG_LEN,
++			       req_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret < 0)
++		return ret;
++	ret = icnss_qmi_result(ic, "host-cap", &resp.resp);
++	return ret == -EOPNOTSUPP ? 0 : ret;
++}
++
++static int icnss_qmi_msa_info(struct icnss_clover *ic)
++{
++	struct wlfw_msa_info_resp_msg_v01 resp = {};
++	struct wlfw_msa_info_req_msg_v01 req = {};
++	struct icnss_mem_region region[ICNSS_MAX_MEM_REGIONS] = {};
++	phys_addr_t end = ic->msa_pa + ic->msa_size;
++	struct qmi_txn txn;
++	bool reclaim_adopted = false;
++	bool retained = false;
++	int i;
++	int ret;
++
++	req.msa_addr = ic->msa_pa;
++	req.size = ic->msa_size;
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_msa_info_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_MSA_INFO_REQ_V01,
++			       WLFW_MSA_INFO_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_msa_info_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret < 0)
++		return ret;
++	ret = icnss_qmi_result(ic, "msa-info", &resp.resp);
++	if (ret == -EREMOTEIO &&
++	    resp.resp.error == QMI_ERR_INCOMPATIBLE_STATE_V01) {
++		mutex_lock(&ic->lock);
++		retained = ic->msa_adopted;
++		mutex_unlock(&ic->lock);
++		if (retained)
++			return -EALREADY;
++	}
++	if (ret)
++		return ret;
++	if (resp.mem_region_info_len > ICNSS_MAX_MEM_REGIONS)
++		return -EOVERFLOW;
++
++	for (i = 0; i < resp.mem_region_info_len; i++) {
++		u64 addr = resp.mem_region_info[i].region_addr;
++		u32 size = resp.mem_region_info[i].size;
++
++		if (addr < ic->msa_pa || addr > end || size > ic->msa_size ||
++		    addr + size < addr || addr + size > end)
++			return -ERANGE;
++		region[i].addr = addr;
++		region[i].size = size;
++		region[i].secure = resp.mem_region_info[i].secure_flag;
++		region[i].owner = ic->msa_fixed_perm ?
++			ICNSS_MSA_OWNER_FIXED : ICNSS_MSA_OWNER_HLOS;
++	}
++
++	mutex_lock(&ic->lock);
++	if (ic->msa_layout_valid) {
++		for (i = 0; i < ic->nr_mem_region; i++)
++			retained |= ic->mem_region[i].owner ==
++				ICNSS_MSA_OWNER_WLAN;
++		if (retained && ic->nr_mem_region != resp.mem_region_info_len) {
++			mutex_unlock(&ic->lock);
++			dev_err(ic->dev,
++				"WLFW changed retained MSA layout during recovery\n");
++			return -ESTALE;
++		}
++		for (i = 0; retained && i < ic->nr_mem_region; i++) {
++			if (ic->mem_region[i].addr != region[i].addr ||
++			    ic->mem_region[i].size != region[i].size ||
++			    ic->mem_region[i].secure != region[i].secure) {
++				mutex_unlock(&ic->lock);
++				dev_err(ic->dev,
++					"WLFW changed retained MSA region %d\n", i);
++				return -ESTALE;
++			}
++		}
++		if (retained) {
++			mutex_unlock(&ic->lock);
++			return 0;
++		}
++	}
++
++	if (ic->msa_adopted) {
++		for (i = 0; i < resp.mem_region_info_len; i++)
++			region[i].owner = ICNSS_MSA_OWNER_WLAN;
++		ic->msa_adopted = false;
++		reclaim_adopted = !ic->msa_fixed_perm;
++		dev_info(ic->dev,
++			 "materialized inherited WLAN MSA layout after recovery\n");
++	}
++	ic->nr_mem_region = resp.mem_region_info_len;
++	memcpy(ic->mem_region, region,
++	       ic->nr_mem_region * sizeof(ic->mem_region[0]));
++	ic->msa_layout_valid = true;
++	mutex_unlock(&ic->lock);
++
++	/*
++	 * ALREADY_REGISTERED does not include the firmware's MSA layout, so an
++	 * adopted session cannot safely change SCM ownership until a subsequent
++	 * WLFW restart returns that layout.  Ownership survives the remoteproc
++	 * restart, however.  Return only these validated regions to HLOS now; the
++	 * normal initialization path below will assign them to the new session.
++	 */
++	if (reclaim_adopted) {
++		for (i = 0; i < resp.mem_region_info_len; i++) {
++			ret = icnss_unassign_one_region(ic, &ic->mem_region[i]);
++			if (ret && ret != -EINVAL) {
++				dev_err(ic->dev,
++					"failed to reclaim inherited MSA region %d: %d\n",
++					i, ret);
++				return ret;
++			}
++			if (ret == -EINVAL)
++				dev_info(ic->dev,
++					 "inherited MSA region %d was already HLOS-owned\n",
++					 i);
++			mutex_lock(&ic->lock);
++			ic->mem_region[i].owner = ICNSS_MSA_OWNER_HLOS;
++			mutex_unlock(&ic->lock);
++		}
++		dev_info(ic->dev,
++			 "reclaimed inherited WLAN MSA layout for reinitialization\n");
++	}
++	return 0;
++}
++
++static int icnss_qmi_msa_ready(struct icnss_clover *ic)
++{
++	struct wlfw_msa_ready_resp_msg_v01 resp = {};
++	struct wlfw_msa_ready_req_msg_v01 req = {};
++	struct qmi_txn txn;
++	int ret;
++
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_msa_ready_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_MSA_READY_REQ_V01,
++			       WLFW_MSA_READY_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_msa_ready_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	return ret < 0 ? ret :
++		icnss_qmi_result(ic, "msa-ready", &resp.resp);
++}
++
++static int icnss_qmi_cap(struct icnss_clover *ic)
++{
++	struct wlfw_cap_resp_msg_v01 *resp;
++	struct wlfw_cap_req_msg_v01 req = {};
++	struct qmi_txn txn;
++	bool adopted;
++	int ret;
++
++	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
++	if (!resp)
++		return -ENOMEM;
++	ret = qmi_txn_init(&ic->qmi, &txn, wlfw_cap_resp_msg_v01_ei, resp);
++	if (ret < 0)
++		goto out;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn, QMI_WLFW_CAP_REQ_V01,
++			       WLFW_CAP_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_cap_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret < 0)
++		goto out;
++	ret = icnss_qmi_result(ic, "cap", &resp->resp);
++	if (ret == -EREMOTEIO &&
++	    resp->resp.error == QMI_ERR_INCOMPATIBLE_STATE_V01) {
++		mutex_lock(&ic->lock);
++		adopted = ic->msa_adopted;
++		mutex_unlock(&ic->lock);
++		if (adopted)
++			ret = -EALREADY;
++	}
++	if (ret)
++		goto out;
++
++	if (resp->chip_info_valid) {
++		ic->soc.chip_id = resp->chip_info.chip_id;
++		ic->soc.chip_family = resp->chip_info.chip_family;
++	}
++	if (resp->board_info_valid)
++		ic->soc.board_id = resp->board_info.board_id;
++	if (resp->soc_info_valid)
++		ic->soc.soc_id = resp->soc_info.soc_id;
++	if (resp->fw_version_info_valid) {
++		ic->soc.fw_version = resp->fw_version_info.fw_version;
++		strscpy(ic->soc.fw_build_timestamp,
++			resp->fw_version_info.fw_build_timestamp,
++			sizeof(ic->soc.fw_build_timestamp));
++	}
++out:
++	kfree(resp);
++	return ret;
++}
++
++static int icnss_qmi_bdf_download(struct icnss_clover *ic,
++				  const struct firmware *fw)
++{
++	struct wlfw_bdf_download_resp_msg_v01 resp = {};
++	struct wlfw_bdf_download_req_msg_v01 *req;
++	const u8 *data = fw->data;
++	size_t remaining = fw->size;
++	struct qmi_txn txn;
++	int ret = 0;
++
++	if (!fw->size || fw->size > U32_MAX)
++		return -EFBIG;
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	while (remaining) {
++		req->valid = 1;
++		req->file_id_valid = 1;
++		req->file_id = 0;
++		req->total_size_valid = 1;
++		req->total_size = fw->size;
++		req->seg_id_valid = 1;
++		req->data_valid = 1;
++		req->data_len = min_t(size_t, remaining,
++				      QMI_WLFW_MAX_DATA_SIZE_V01);
++		req->end_valid = 1;
++		req->end = remaining == req->data_len;
++		memcpy(req->data, data, req->data_len);
++
++		ret = qmi_txn_init(&ic->qmi, &txn,
++				   wlfw_bdf_download_resp_msg_v01_ei, &resp);
++		if (ret < 0)
++			break;
++		ret = qmi_send_request(&ic->qmi, NULL, &txn,
++				       QMI_WLFW_BDF_DOWNLOAD_REQ_V01,
++				       WLFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_MSG_LEN,
++				       wlfw_bdf_download_req_msg_v01_ei, req);
++		if (ret) {
++			qmi_txn_cancel(&txn);
++			break;
++		}
++		ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++		if (ret < 0)
++			break;
++		ret = icnss_qmi_result(ic, "bdf-download", &resp.resp);
++		/* Released WCN3990 BDFs can fail only the final CRC check. */
++		if (ret && !(req->end &&
++			     resp.resp.error == QMI_ERR_MALFORMED_MSG_V01))
++			break;
++		ret = 0;
++		remaining -= req->data_len;
++		data += req->data_len;
++		req->seg_id++;
++	}
++	kfree(req);
++	return ret;
++}
++
++static int icnss_qmi_cal_report(struct icnss_clover *ic)
++{
++	struct wlfw_cal_report_resp_msg_v01 resp = {};
++	struct wlfw_cal_report_req_msg_v01 req = {};
++	struct qmi_txn txn;
++	int ret;
++
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_cal_report_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_CAL_REPORT_REQ_V01,
++			       WLFW_CAL_REPORT_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_cal_report_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	return ret < 0 ? ret :
++		icnss_qmi_result(ic, "cal-report", &resp.resp);
++}
++
++static void icnss_bdf_work(struct work_struct *work)
++{
++	struct icnss_clover *ic =
++		container_of(work, struct icnss_clover, bdf_work);
++	const struct firmware *fw;
++	int ret;
++
++	ret = request_firmware(&fw, ICNSS_BDF_FILE, ic->dev);
++	if (ret) {
++		dev_err(ic->dev, "failed to load %s: %d\n", ICNSS_BDF_FILE, ret);
++		goto failed;
++	}
++	ret = icnss_qmi_bdf_download(ic, fw);
++	release_firmware(fw);
++	if (ret)
++		goto failed;
++	ret = icnss_qmi_cal_report(ic);
++	if (ret)
++		goto failed;
++	dev_info(ic->dev, "WLFW board data and calibration report completed\n");
++	return;
++
++failed:
++	icnss_hw_power_off(ic);
++	icnss_set_failed(ic, ret);
++}
++
++static int icnss_qmi_cfg(struct icnss_clover *ic,
++			 struct icnss_wlan_enable_cfg *config,
++			 const char *host_version)
++{
++	struct wlfw_wlan_cfg_resp_msg_v01 resp = {};
++	struct wlfw_wlan_cfg_req_msg_v01 *req;
++	struct qmi_txn txn;
++	u32 i;
++	int ret;
++
++	if (!config || !config->ce_tgt_cfg || !config->ce_svc_cfg)
++		return -EINVAL;
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	if (host_version) {
++		req->host_version_valid = 1;
++		strscpy(req->host_version, host_version,
++			sizeof(req->host_version));
++	}
++	req->tgt_cfg_valid = 1;
++	req->tgt_cfg_len = min_t(u32, config->num_ce_tgt_cfg,
++				 QMI_WLFW_MAX_NUM_CE_V01);
++	for (i = 0; i < req->tgt_cfg_len; i++) {
++		req->tgt_cfg[i].pipe_num = config->ce_tgt_cfg[i].pipe_num;
++		req->tgt_cfg[i].pipe_dir = config->ce_tgt_cfg[i].pipe_dir;
++		req->tgt_cfg[i].nentries = config->ce_tgt_cfg[i].nentries;
++		req->tgt_cfg[i].nbytes_max = config->ce_tgt_cfg[i].nbytes_max;
++		req->tgt_cfg[i].flags = config->ce_tgt_cfg[i].flags;
++	}
++	req->svc_cfg_valid = 1;
++	req->svc_cfg_len = min_t(u32, config->num_ce_svc_pipe_cfg,
++				 QMI_WLFW_MAX_NUM_SVC_V01);
++	for (i = 0; i < req->svc_cfg_len; i++) {
++		req->svc_cfg[i].service_id = config->ce_svc_cfg[i].service_id;
++		req->svc_cfg[i].pipe_dir = config->ce_svc_cfg[i].pipe_dir;
++		req->svc_cfg[i].pipe_num = config->ce_svc_cfg[i].pipe_num;
++	}
++	req->shadow_reg_valid = 1;
++	req->shadow_reg_len = min_t(u32, config->num_shadow_reg_cfg,
++				    QMI_WLFW_MAX_NUM_SHADOW_REG_V01);
++	for (i = 0; i < req->shadow_reg_len; i++) {
++		req->shadow_reg[i].id = config->shadow_reg_cfg[i].ce_id;
++		req->shadow_reg[i].offset =
++			config->shadow_reg_cfg[i].reg_offset;
++	}
++
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_wlan_cfg_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		goto out;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_WLAN_CFG_REQ_V01,
++			       WLFW_WLAN_CFG_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_wlan_cfg_req_msg_v01_ei, req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret >= 0)
++		ret = icnss_qmi_result(ic, "wlan-cfg", &resp.resp);
++out:
++	kfree(req);
++	return ret;
++}
++
++static int icnss_qmi_mode(struct icnss_clover *ic,
++			  enum wlfw_driver_mode_enum_v01 mode)
++{
++	struct wlfw_wlan_mode_resp_msg_v01 resp = {};
++	struct wlfw_wlan_mode_req_msg_v01 req = {};
++	struct qmi_txn txn;
++	int ret;
++
++	req.mode = mode;
++	req.hw_debug_valid = 1;
++	req.hw_debug = 0;
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_wlan_mode_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_WLAN_MODE_REQ_V01,
++			       WLFW_WLAN_MODE_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_wlan_mode_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	return ret < 0 ? ret :
++		icnss_qmi_result(ic, "wlan-mode", &resp.resp);
++}
++
++static int icnss_qmi_ini(struct icnss_clover *ic, u8 mode)
++{
++	struct wlfw_ini_resp_msg_v01 resp = {};
++	struct wlfw_ini_req_msg_v01 req = {};
++	struct qmi_txn txn;
++	int ret;
++
++	req.enablefwlog_valid = 1;
++	req.enablefwlog = mode;
++	ret = qmi_txn_init(&ic->qmi, &txn, wlfw_ini_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn, QMI_WLFW_INI_REQ_V01,
++			       WLFW_INI_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_ini_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	return ret < 0 ? ret : icnss_result_to_errno(&resp.resp);
++}
++
++static void icnss_call_fw_ready(struct icnss_clover *ic)
++{
++	struct icnss_uevent_data event = {
++		.uevent = ICNSS_UEVENT_FW_READY,
++	};
++	struct icnss_driver_ops *ops;
++	bool reinit;
++	int ret = 0;
++
++	mutex_lock(&ic->lock);
++	if (ic->removing || !ic->qmi_connected) {
++		mutex_unlock(&ic->lock);
++		return;
++	}
++	ic->fw_ready = true;
++	ops = ic->ops;
++	reinit = ic->recovering && ic->driver_probed;
++	if (!ops) {
++		ic->recovery_state = ICNSS_RECOVERY_FW_READY;
++		ic->last_error = 0;
++	}
++	mutex_unlock(&ic->lock);
++
++	if (!ops)
++		return;
++	if (reinit && ops->shutdown)
++		ops->shutdown(ic->dev);
++	ret = icnss_hw_power_on(ic);
++	if (ret)
++		goto failed;
++	if (reinit && ops->reinit)
++		ret = ops->reinit(ic->dev);
++	else if (reinit)
++		ret = -EOPNOTSUPP;
++	else if (!ic->driver_probed)
++		ret = ops->probe(ic->dev);
++	if (!ret) {
++		mutex_lock(&ic->lock);
++		ic->active_ops = ops;
++		ic->driver_probed = true;
++		ic->recovering = false;
++		ic->recovery_state = ICNSS_RECOVERY_READY;
++		ic->last_error = 0;
++		mutex_unlock(&ic->lock);
++		if (ops->uevent)
++			ops->uevent(ic->dev, &event);
++		return;
++	}
++	icnss_hw_power_off(ic);
++failed:
++	icnss_set_failed(ic, ret);
++	dev_err(ic->dev, "qcacld ready callback failed: %d\n", ret);
++}
++
++static void icnss_fw_ready_work(struct work_struct *work)
++{
++	struct icnss_clover *ic =
++		container_of(work, struct icnss_clover, fw_ready_work);
++
++	icnss_call_fw_ready(ic);
++}
++
++static void icnss_server_exit_work(struct work_struct *work)
++{
++	struct icnss_clover *ic =
++		container_of(work, struct icnss_clover, server_exit_work);
++	struct icnss_uevent_fw_down_data down = { .crashed = true };
++	struct icnss_uevent_data event = {
++		.uevent = ICNSS_UEVENT_FW_DOWN,
++		.data = &down,
++	};
++	struct icnss_driver_ops *ops;
++
++	mutex_lock(&ic->lock);
++	dev_info(ic->dev,
++		 "WLFW service exit work in state %s (connected=%u)\n",
++		 icnss_recovery_state_name(ic->recovery_state),
++		 ic->qmi_connected);
++	ic->qmi_connected = false;
++	ic->fw_ready = false;
++	ic->msa_ready = false;
++	ops = ic->active_ops;
++	if (ic->driver_probed) {
++		ic->recovering = true;
++		icnss_begin_recovery_locked(ic);
++	} else {
++		ic->recovery_state = ICNSS_RECOVERY_INACTIVE;
++	}
++	mutex_unlock(&ic->lock);
++	if (ops && ops->uevent)
++		ops->uevent(ic->dev, &event);
++}
++
++static void icnss_server_work(struct work_struct *work)
++{
++	struct icnss_clover *ic =
++		container_of(work, struct icnss_clover, server_work);
++	const char *stage = "ind-register";
++	bool assigned_here;
++	bool msa_ready = false;
++	bool ready;
++	int ret;
++
++	ret = icnss_qmi_ind_register(ic);
++	if (ret)
++		goto fail_power;
++	mutex_lock(&ic->lock);
++	ready = ic->fw_ready;
++	mutex_unlock(&ic->lock);
++	if (ready) {
++		dev_info(ic->dev, "adopting already-ready WLFW state\n");
++		stage = "cap";
++		ret = icnss_qmi_cap(ic);
++		if (ret && ret != -EALREADY)
++			goto fail_power;
++		if (ret == -EALREADY)
++			dev_info(ic->dev,
++				 "adopting already-complete WLFW capability state\n");
++		goto firmware_ready;
++	}
++	stage = "host-cap";
++	ret = icnss_qmi_host_cap(ic);
++	if (ret)
++		goto fail_power;
++	stage = "msa-info";
++	ret = icnss_qmi_msa_info(ic);
++	if (ret == -EALREADY) {
++		dev_info(ic->dev,
++			 "adopting already-registered WLFW MSA state\n");
++		stage = "cap";
++		ret = icnss_qmi_cap(ic);
++		if (ret && ret != -EALREADY)
++			goto fail_power;
++		if (ret == -EALREADY)
++			dev_info(ic->dev,
++				 "adopting already-complete WLFW capability state\n");
++		mutex_lock(&ic->lock);
++		ic->fw_ready = true;
++		ready = true;
++		mutex_unlock(&ic->lock);
++		goto firmware_ready;
++	}
++	if (ret)
++		goto fail_power;
++	msleep(20);
++	assigned_here = !icnss_msa_wlan_owned(ic) && !ic->msa_fixed_perm;
++	stage = "msa-assign";
++	ret = icnss_assign_msa(ic);
++	if (ret)
++		goto fail_power;
++	stage = "msa-ready";
++	ret = icnss_qmi_msa_ready(ic);
++	if (ret)
++		goto fail_msa;
++	stage = "cap";
++	ret = icnss_qmi_cap(ic);
++	if (ret)
++		goto fail_msa;
++	mutex_lock(&ic->lock);
++	ready = ic->fw_ready;
++	mutex_unlock(&ic->lock);
++	if (!ready && device_property_read_bool(ic->dev,
++					       "qcom,no-msa-ready-indicator")) {
++		/*
++		 * Clover firmware does not raise MSA_READY as an indication.
++		 * Match ath10k_snoc and start BDF delivery immediately after CAP;
++		 * a second indication registration here changes the old firmware's
++		 * initialization sequence.
++		 */
++		queue_work(ic->wq, &ic->bdf_work);
++		return;
++	}
++	if (!ready) {
++		/*
++		 * FW_READY can be raised while server_work is still processing
++		 * MSA/CAP setup.  Re-registering indications also returns the
++		 * latched firmware status, closing that one-shot indication race.
++		 */
++		stage = "ready-status";
++		ret = icnss_qmi_ind_register(ic);
++		if (ret)
++			goto fail_msa;
++		mutex_lock(&ic->lock);
++		ready = ic->fw_ready;
++		msa_ready = ic->msa_ready;
++		mutex_unlock(&ic->lock);
++	}
++firmware_ready:
++	/* WLFW still needs the powered hardware to raise FW_READY. */
++	if (!ready) {
++		if (msa_ready)
++			queue_work(ic->wq, &ic->bdf_work);
++		return;
++	}
++	icnss_hw_power_off(ic);
++	if (ready) {
++		/* Publish protocol readiness before deferred qcacld callbacks. */
++		mutex_lock(&ic->lock);
++		dev_info(ic->dev,
++			 "publishing WLFW ready from state %s (connected=%u)\n",
++			 icnss_recovery_state_name(ic->recovery_state),
++			 ic->qmi_connected);
++		ic->recovery_state = ICNSS_RECOVERY_FW_READY;
++		ic->last_error = 0;
++		mutex_unlock(&ic->lock);
++		queue_work(ic->wq, &ic->fw_ready_work);
++	}
++	return;
++
++fail_msa:
++	if (assigned_here)
++		icnss_unassign_msa(ic);
++fail_power:
++	icnss_hw_power_off(ic);
++fail:
++	icnss_set_failed(ic, ret);
++	dev_err(ic->dev, "WLFW initialization failed at %s: %d\n",
++		stage, ret);
++}
++
++static void icnss_qmi_fw_ready_ind(struct qmi_handle *qmi,
++				   struct sockaddr_qrtr *sq,
++				   struct qmi_txn *txn, const void *data)
++{
++	struct icnss_clover *ic =
++		container_of(qmi, struct icnss_clover, qmi);
++
++	queue_work(ic->wq, &ic->fw_ready_work);
++}
++
++static void icnss_qmi_msa_ready_ind(struct qmi_handle *qmi,
++				    struct sockaddr_qrtr *sq,
++				    struct qmi_txn *txn, const void *data)
++{
++	struct icnss_clover *ic =
++		container_of(qmi, struct icnss_clover, qmi);
++
++	mutex_lock(&ic->lock);
++	ic->msa_ready = true;
++	mutex_unlock(&ic->lock);
++	queue_work(ic->wq, &ic->bdf_work);
++}
++
++static const struct qmi_msg_handler icnss_qmi_handlers[] = {
++	{
++		.type = QMI_INDICATION,
++		.msg_id = QMI_WLFW_MSA_READY_IND_V01,
++		.ei = wlfw_msa_ready_ind_msg_v01_ei,
++		.decoded_size = sizeof(struct wlfw_msa_ready_ind_msg_v01),
++		.fn = icnss_qmi_msa_ready_ind,
++	},
++	{
++		.type = QMI_INDICATION,
++		.msg_id = QMI_WLFW_FW_READY_IND_V01,
++		.ei = wlfw_fw_ready_ind_msg_v01_ei,
++		.decoded_size = sizeof(struct wlfw_fw_ready_ind_msg_v01),
++		.fn = icnss_qmi_fw_ready_ind,
++	},
++	{}
++};
++
++static int icnss_qmi_new_server(struct qmi_handle *qmi,
++				struct qmi_service *service)
++{
++	struct icnss_clover *ic =
++		container_of(qmi, struct icnss_clover, qmi);
++	int ret;
++
++	ic->sq.sq_family = AF_QIPCRTR;
++	ic->sq.sq_node = service->node;
++	ic->sq.sq_port = service->port;
++	ret = kernel_connect(qmi->sock, (struct sockaddr_unsized *)&ic->sq,
++			     sizeof(ic->sq), 0);
++	if (ret)
++		return ret;
++	mutex_lock(&ic->lock);
++	dev_info(ic->dev,
++		 "WLFW service arrival in state %s (connected=%u busy=%u)\n",
++		 icnss_recovery_state_name(ic->recovery_state),
++		 ic->qmi_connected, work_busy(&ic->server_work));
++	ic->qmi_connected = true;
++	/* Duplicate service discovery must not regress completed server_work. */
++	if (ic->recovery_state != ICNSS_RECOVERY_RECOVERING &&
++	    ic->recovery_state != ICNSS_RECOVERY_FW_READY &&
++	    ic->recovery_state != ICNSS_RECOVERY_READY)
++		ic->recovery_state = ICNSS_RECOVERY_INITIALIZING;
++	ic->last_error = 0;
++	mutex_unlock(&ic->lock);
++	queue_work(ic->wq, &ic->server_work);
++	return 0;
++}
++
++static void icnss_qmi_del_server(struct qmi_handle *qmi,
++				 struct qmi_service *service)
++{
++	struct icnss_clover *ic =
++		container_of(qmi, struct icnss_clover, qmi);
++
++	if (!ic->removing)
++		queue_work(ic->wq, &ic->server_exit_work);
++}
++
++static const struct qmi_ops icnss_qmi_ops = {
++	.new_server = icnss_qmi_new_server,
++	.del_server = icnss_qmi_del_server,
++};
++
++int __icnss_register_driver(struct icnss_driver_ops *ops,
++			    struct module *owner, const char *mod_name)
++{
++	struct icnss_clover *ic = icnss_from_dev(NULL);
++	bool ready;
++
++	if (!ic)
++		return -EPROBE_DEFER;
++	if (!ops || !ops->probe || !owner || !mod_name)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	if (ic->ops) {
++		mutex_unlock(&ic->lock);
++		return -EBUSY;
++	}
++	ic->ops = ops;
++	ready = ic->fw_ready;
++	mutex_unlock(&ic->lock);
++	if (ready)
++		icnss_call_fw_ready(ic);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(__icnss_register_driver);
++
++int icnss_unregister_driver(struct icnss_driver_ops *ops)
++{
++	struct icnss_clover *ic = icnss_from_dev(NULL);
++	bool remove;
++
++	if (!ic)
++		return -ENODEV;
++	mutex_lock(&ic->lock);
++	if (ic->ops != ops) {
++		mutex_unlock(&ic->lock);
++		return -ENOENT;
++	}
++	remove = ic->driver_probed;
++	ic->ops = NULL;
++	ic->active_ops = NULL;
++	ic->driver_probed = false;
++	ic->recovering = false;
++	ic->recovery_state = ic->fw_ready ? ICNSS_RECOVERY_FW_READY :
++		ICNSS_RECOVERY_INACTIVE;
++	mutex_unlock(&ic->lock);
++	if (remove && ops->remove)
++		ops->remove(ic->dev);
++	icnss_hw_power_off(ic);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_unregister_driver);
++
++int icnss_wlan_enable(struct device *dev, struct icnss_wlan_enable_cfg *cfg,
++		      enum icnss_driver_mode mode, const char *host_version)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++	enum wlfw_driver_mode_enum_v01 qmi_mode;
++	bool adopted;
++	int ret;
++
++	if (!ic)
++		return -ENODEV;
++	switch (mode) {
++	case ICNSS_MISSION: qmi_mode = QMI_WLFW_MISSION_V01; break;
++	case ICNSS_FTM: qmi_mode = QMI_WLFW_FTM_V01; break;
++	case ICNSS_EPPING: qmi_mode = QMI_WLFW_EPPING_V01; break;
++	case ICNSS_WALTEST: qmi_mode = QMI_WLFW_WALTEST_V01; break;
++	case ICNSS_OFF: qmi_mode = QMI_WLFW_OFF_V01; break;
++	case ICNSS_CCPM: qmi_mode = QMI_WLFW_CCPM_V01; break;
++	case ICNSS_QVIT: qmi_mode = QMI_WLFW_QVIT_V01; break;
++	default: return -EINVAL;
++	}
++	mutex_lock(&ic->lock);
++	ret = ic->qmi_connected && ic->fw_ready ? 0 : -ENETDOWN;
++	adopted = ic->msa_adopted;
++	mutex_unlock(&ic->lock);
++	if (ret)
++		return ret;
++	if (adopted) {
++		dev_info(ic->dev,
++			 "stopping inherited WLAN mode before reconfiguration\n");
++		ret = icnss_qmi_mode(ic, QMI_WLFW_OFF_V01);
++		if (ret)
++			return ret;
++	}
++	ret = icnss_qmi_cfg(ic, cfg, host_version);
++	return ret ? ret : icnss_qmi_mode(ic, qmi_mode);
++}
++EXPORT_SYMBOL_GPL(icnss_wlan_enable);
++
++int icnss_wlan_disable(struct device *dev, enum icnss_driver_mode mode)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	return ic ? icnss_qmi_mode(ic, QMI_WLFW_OFF_V01) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(icnss_wlan_disable);
++
++int icnss_ce_request_irq(struct device *dev, unsigned int ce_id,
++			 irqreturn_t (*handler)(int, void *), unsigned long flags,
++			 const char *name, void *ctx)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++	int ret;
++
++	if (!ic || ce_id >= ARRAY_SIZE(ic->ce) || !handler)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	if (ic->ce[ce_id].requested) {
++		mutex_unlock(&ic->lock);
++		return -EEXIST;
++	}
++	ret = request_irq(ic->ce[ce_id].irq, handler, flags, name, ctx);
++	if (!ret) {
++		ic->ce[ce_id].ctx = ctx;
++		ic->ce[ce_id].requested = true;
++	}
++	mutex_unlock(&ic->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(icnss_ce_request_irq);
++
++int icnss_ce_free_irq(struct device *dev, unsigned int ce_id, void *ctx)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	if (!ic || ce_id >= ARRAY_SIZE(ic->ce))
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	if (!ic->ce[ce_id].requested || ic->ce[ce_id].ctx != ctx) {
++		mutex_unlock(&ic->lock);
++		return -ENOENT;
++	}
++	free_irq(ic->ce[ce_id].irq, ctx);
++	ic->ce[ce_id].requested = false;
++	ic->ce[ce_id].ctx = NULL;
++	mutex_unlock(&ic->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_ce_free_irq);
++
++void icnss_enable_irq(struct device *dev, unsigned int ce_id)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	if (ic && ce_id < ARRAY_SIZE(ic->ce))
++		enable_irq(ic->ce[ce_id].irq);
++}
++EXPORT_SYMBOL_GPL(icnss_enable_irq);
++
++void icnss_disable_irq(struct device *dev, unsigned int ce_id)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	if (ic && ce_id < ARRAY_SIZE(ic->ce))
++		disable_irq(ic->ce[ce_id].irq);
++}
++EXPORT_SYMBOL_GPL(icnss_disable_irq);
++
++int icnss_get_irq(struct device *dev, int ce_id)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	return !ic || ce_id < 0 || ce_id >= ARRAY_SIZE(ic->ce) ?
++		-EINVAL : ic->ce[ce_id].irq;
++}
++EXPORT_SYMBOL_GPL(icnss_get_irq);
++
++int icnss_get_ce_id(struct device *dev, int irq)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++	int i;
++
++	if (!ic)
++		return -ENODEV;
++	for (i = 0; i < ARRAY_SIZE(ic->ce); i++)
++		if (ic->ce[i].irq == irq)
++			return i;
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(icnss_get_ce_id);
++
++int icnss_get_soc_info(struct device *dev, struct icnss_soc_info *info)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	if (!ic || !info)
++		return -EINVAL;
++	*info = ic->soc;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_get_soc_info);
++
++int icnss_set_fw_log_mode(struct device *dev, u8 fw_log_mode)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	return ic ? icnss_qmi_ini(ic, fw_log_mode) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(icnss_set_fw_log_mode);
++
++int icnss_power_on(struct device *dev)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	return ic ? icnss_hw_power_on(ic) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(icnss_power_on);
++
++int icnss_power_off(struct device *dev)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	return ic ? icnss_hw_power_off(ic) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(icnss_power_off);
++
++struct dma_iommu_mapping *icnss_smmu_get_mapping(struct device *dev)
++{
++	/* Modern DMA-IOMMU is owned by the device; qcacld uses DMA APIs. */
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(icnss_smmu_get_mapping);
++
++int icnss_smmu_map(struct device *dev, phys_addr_t paddr, u32 *iova_addr,
++		   size_t size)
++{
++	dma_addr_t dma;
++
++	if (!dev || !iova_addr)
++		return -EINVAL;
++	dma = dma_map_resource(dev, paddr, size, DMA_BIDIRECTIONAL, 0);
++	if (dma_mapping_error(dev, dma))
++		return -EIO;
++	if (upper_32_bits(dma))
++		dma_unmap_resource(dev, dma, size, DMA_BIDIRECTIONAL, 0);
++	if (upper_32_bits(dma))
++		return -ERANGE;
++	*iova_addr = lower_32_bits(dma);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_smmu_map);
++
++u8 *icnss_get_wlan_mac_address(struct device *dev, u32 *num)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++
++	if (num)
++		*num = ic && is_valid_ether_addr(ic->mac_addr) ? 1 : 0;
++	return ic && is_valid_ether_addr(ic->mac_addr) ? ic->mac_addr : NULL;
++}
++EXPORT_SYMBOL_GPL(icnss_get_wlan_mac_address);
++
++int icnss_set_wlan_unsafe_channel(u16 *list, u16 count)
++{
++	struct icnss_clover *ic = icnss_from_dev(NULL);
++
++	if (!ic || (count && !list) || count > ICNSS_MAX_UNSAFE_CHANNELS)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	memcpy(ic->unsafe_channels, list, count * sizeof(*list));
++	ic->unsafe_channel_count = count;
++	mutex_unlock(&ic->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_set_wlan_unsafe_channel);
++
++int icnss_get_wlan_unsafe_channel(u16 *list, u16 *count, u16 buf_len)
++{
++	struct icnss_clover *ic = icnss_from_dev(NULL);
++	size_t bytes;
++
++	if (!ic || !list || !count)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	bytes = ic->unsafe_channel_count * sizeof(*list);
++	if (buf_len < bytes) {
++		mutex_unlock(&ic->lock);
++		return -ENOSPC;
++	}
++	memcpy(list, ic->unsafe_channels, bytes);
++	*count = ic->unsafe_channel_count;
++	mutex_unlock(&ic->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_get_wlan_unsafe_channel);
++
++int icnss_wlan_set_dfs_nol(const void *info, u16 len)
++{
++	struct icnss_clover *ic = icnss_from_dev(NULL);
++	void *copy;
++
++	if (!ic || (len && !info))
++		return -EINVAL;
++	copy = len ? kmemdup(info, len, GFP_KERNEL) : NULL;
++	if (len && !copy)
++		return -ENOMEM;
++	mutex_lock(&ic->lock);
++	kfree(ic->dfs_nol);
++	ic->dfs_nol = copy;
++	ic->dfs_nol_len = len;
++	mutex_unlock(&ic->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_wlan_set_dfs_nol);
++
++int icnss_wlan_get_dfs_nol(void *info, u16 len)
++{
++	struct icnss_clover *ic = icnss_from_dev(NULL);
++
++	if (!ic || !info)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	if (len < ic->dfs_nol_len) {
++		mutex_unlock(&ic->lock);
++		return -ENOSPC;
++	}
++	memcpy(info, ic->dfs_nol, ic->dfs_nol_len);
++	mutex_unlock(&ic->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_wlan_get_dfs_nol);
++
++int icnss_trigger_recovery(struct device *dev)
++{
++	struct icnss_clover *ic = icnss_from_dev(dev);
++	struct icnss_driver_ops *ops;
++
++	if (!ic)
++		return -ENODEV;
++	mutex_lock(&ic->lock);
++	ops = ic->active_ops;
++	ic->recovering = ic->driver_probed;
++	if (ic->recovering)
++		icnss_begin_recovery_locked(ic);
++	mutex_unlock(&ic->lock);
++	if (ops && ops->crash_shutdown)
++		ops->crash_shutdown(ic->dev);
++	return icnss_qmi_mode(ic, QMI_WLFW_OFF_V01);
++}
++EXPORT_SYMBOL_GPL(icnss_trigger_recovery);
++
++int icnss_athdiag_read(struct device *dev, u32 offset, u32 mem_type,
++		       u32 data_len, u8 *output)
++{
++	struct wlfw_athdiag_read_req_msg_v01 req = {
++		.offset = offset,
++		.mem_type = mem_type,
++		.data_len = data_len,
++	};
++	struct wlfw_athdiag_read_resp_msg_v01 *resp;
++	struct icnss_clover *ic = icnss_from_dev(dev);
++	struct qmi_txn txn;
++	int ret;
++
++	if (!ic)
++		return -ENODEV;
++	if (!output || !data_len ||
++	    data_len > QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	ret = ic->qmi_connected && ic->fw_ready && ic->powered ?
++		0 : -ENETDOWN;
++	mutex_unlock(&ic->lock);
++	if (ret)
++		return ret;
++	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
++	if (!resp)
++		return -ENOMEM;
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_athdiag_read_resp_msg_v01_ei, resp);
++	if (ret < 0)
++		goto out;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_ATHDIAG_READ_REQ_V01,
++			       WLFW_ATHDIAG_READ_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_athdiag_read_req_msg_v01_ei, &req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret >= 0)
++		ret = icnss_result_to_errno(&resp->resp);
++	if (!ret && (!resp->data_valid || resp->data_len < data_len))
++		ret = -EMSGSIZE;
++	if (!ret)
++		memcpy(output, resp->data, data_len);
++out:
++	kfree(resp);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(icnss_athdiag_read);
++
++int icnss_athdiag_write(struct device *dev, u32 offset, u32 mem_type,
++			u32 data_len, u8 *input)
++{
++	struct wlfw_athdiag_write_req_msg_v01 *req;
++	struct wlfw_athdiag_write_resp_msg_v01 resp = {};
++	struct icnss_clover *ic = icnss_from_dev(dev);
++	struct qmi_txn txn;
++	int ret;
++
++	if (!ic)
++		return -ENODEV;
++	if (!input || !data_len ||
++	    data_len > QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01)
++		return -EINVAL;
++	mutex_lock(&ic->lock);
++	ret = ic->qmi_connected && ic->fw_ready && ic->powered ?
++		0 : -ENETDOWN;
++	mutex_unlock(&ic->lock);
++	if (ret)
++		return ret;
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++	req->offset = offset;
++	req->mem_type = mem_type;
++	req->data_len = data_len;
++	memcpy(req->data, input, data_len);
++	ret = qmi_txn_init(&ic->qmi, &txn,
++			   wlfw_athdiag_write_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		goto out;
++	ret = qmi_send_request(&ic->qmi, NULL, &txn,
++			       QMI_WLFW_ATHDIAG_WRITE_REQ_V01,
++			       WLFW_ATHDIAG_WRITE_REQ_MSG_V01_MAX_MSG_LEN,
++			       wlfw_athdiag_write_req_msg_v01_ei, req);
++	if (ret) {
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++	ret = qmi_txn_wait(&txn, ICNSS_WLFW_TIMEOUT * HZ);
++	if (ret >= 0)
++		ret = icnss_result_to_errno(&resp.resp);
++out:
++	kfree(req);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(icnss_athdiag_write);
++
++bool icnss_is_qmi_disable(struct device *dev)
++{
++	return false;
++}
++EXPORT_SYMBOL_GPL(icnss_is_qmi_disable);
++
++unsigned int icnss_socinfo_get_serial_number(struct device *dev)
++{
++	return 0;
++}
++EXPORT_SYMBOL_GPL(icnss_socinfo_get_serial_number);
++
++void cnss_set_cc_source(enum cnss_cc_src source)
++{
++	icnss_cc_source = source;
++}
++EXPORT_SYMBOL_GPL(cnss_set_cc_source);
++
++enum cnss_cc_src cnss_get_cc_source(void)
++{
++	return icnss_cc_source;
++}
++EXPORT_SYMBOL_GPL(cnss_get_cc_source);
++
++void icnss_set_cc_source(enum cnss_cc_src source)
++{
++	cnss_set_cc_source(source);
++}
++EXPORT_SYMBOL_GPL(icnss_set_cc_source);
++
++enum cnss_cc_src icnss_get_cc_source(void)
++{
++	return cnss_get_cc_source();
++}
++EXPORT_SYMBOL_GPL(icnss_get_cc_source);
++
++int icnss_get_driver_load_cnt(void)
++{
++	return atomic_read(&icnss_driver_load_count);
++}
++EXPORT_SYMBOL_GPL(icnss_get_driver_load_cnt);
++
++void icnss_increment_driver_load_cnt(void)
++{
++	atomic_inc(&icnss_driver_load_count);
++}
++EXPORT_SYMBOL_GPL(icnss_increment_driver_load_cnt);
++
++static ssize_t recovery_state_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	const char *state;
++
++	mutex_lock(&ic->lock);
++	state = icnss_recovery_state_name(ic->recovery_state);
++	mutex_unlock(&ic->lock);
++
++	return sysfs_emit(buf, "%s\n", state);
++}
++static DEVICE_ATTR_RO(recovery_state);
++
++static ssize_t recovery_generation_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	u32 generation;
++
++	mutex_lock(&ic->lock);
++	generation = ic->recovery_generation;
++	mutex_unlock(&ic->lock);
++
++	return sysfs_emit(buf, "%u\n", generation);
++}
++static DEVICE_ATTR_RO(recovery_generation);
++
++static ssize_t last_error_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	int error;
++
++	mutex_lock(&ic->lock);
++	error = ic->last_error;
++	mutex_unlock(&ic->lock);
++
++	return sysfs_emit(buf, "%d\n", error);
++}
++static DEVICE_ATTR_RO(last_error);
++
++static ssize_t msa_owner_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	const char *owner = "unknown";
++	bool hlos = false;
++	bool wlan = false;
++	int i;
++
++	mutex_lock(&ic->lock);
++	if (ic->msa_fixed_perm) {
++		owner = "fixed";
++	} else if (ic->msa_adopted) {
++		owner = "wlan-adopted";
++	} else if (ic->msa_layout_valid) {
++		for (i = 0; i < ic->nr_mem_region; i++) {
++			hlos |= ic->mem_region[i].owner == ICNSS_MSA_OWNER_HLOS;
++			wlan |= ic->mem_region[i].owner == ICNSS_MSA_OWNER_WLAN;
++		}
++		owner = hlos && wlan ? "mixed" : wlan ? "wlan" : "hlos";
++	}
++	mutex_unlock(&ic->lock);
++
++	return sysfs_emit(buf, "%s\n", owner);
++}
++static DEVICE_ATTR_RO(msa_owner);
++
++static struct attribute *icnss_clover_attrs[] = {
++	&dev_attr_recovery_state.attr,
++	&dev_attr_recovery_generation.attr,
++	&dev_attr_last_error.attr,
++	&dev_attr_msa_owner.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(icnss_clover);
++
++static int icnss_clover_get_irq(struct platform_device *pdev,
++				unsigned int index)
++{
++	struct of_phandle_args oirq;
++	struct irq_domain *domain;
++	irq_hw_number_t hwirq;
++	unsigned int type;
++	unsigned int irq;
++	int ret;
++
++	ret = platform_get_irq(pdev, index);
++	if (ret != -ENXIO)
++		return ret;
++
++	/*
++	 * A live driver handoff can leave the existing GIC mappings intact
++	 * after the platform IRQ resource array has been released.  Recover
++	 * those mappings from the immutable OF interrupt specifiers.
++	 */
++	ret = of_irq_parse_one(pdev->dev.of_node, index, &oirq);
++	if (ret)
++		return ret;
++	domain = irq_find_host(oirq.np);
++	if (!domain) {
++		ret = -EPROBE_DEFER;
++		goto out_put;
++	}
++	if (!domain->ops->xlate) {
++		ret = -EOPNOTSUPP;
++		goto out_put;
++	}
++	ret = domain->ops->xlate(domain, oirq.np, oirq.args,
++				 oirq.args_count, &hwirq, &type);
++	if (ret)
++		goto out_put;
++	irq = irq_find_mapping(domain, hwirq);
++	if (!irq) {
++		ret = -ENXIO;
++		goto out_put;
++	}
++	irq_set_irq_type(irq, type);
++	ret = irq;
++
++out_put:
++	of_node_put(oirq.np);
++	return ret;
++}
++
++static int icnss_clover_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct icnss_clover *ic;
++	struct resource r;
++	int i;
++	int ret;
++
++	ic = devm_kzalloc(dev, sizeof(*ic), GFP_KERNEL);
++	if (!ic)
++		return -ENOMEM;
++	ic->dev = dev;
++	mutex_init(&ic->lock);
++	platform_set_drvdata(pdev, ic);
++
++	/*
++	 * qcacld's WCN3990 HTT fragment descriptors carry only the low
++	 * 32 address bits.  A wider mask lets DMA-IOMMU hand out IOVAs that
++	 * firmware subsequently truncates, causing an unmapped access.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	ic->mem_base = devm_platform_ioremap_resource_byname(pdev, "membase");
++	if (IS_ERR(ic->mem_base))
++		return PTR_ERR(ic->mem_base);
++	ic->mem_base_pa =
++		platform_get_resource_byname(pdev, IORESOURCE_MEM, "membase")->start;
++	ic->soc.v_addr = ic->mem_base;
++	ic->soc.p_addr = ic->mem_base_pa;
++
++	for (i = 0; i < ARRAY_SIZE(ic->ce); i++) {
++		ret = icnss_clover_get_irq(pdev, i);
++		if (ret < 0)
++			return ret;
++		ic->ce[i].irq = ret;
++	}
++	for (i = 0; i < ARRAY_SIZE(ic->vregs); i++)
++		ic->vregs[i].supply = icnss_vreg_names[i];
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ic->vregs), ic->vregs);
++	if (ret)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(ic->clks); i++)
++		ic->clks[i].id = icnss_clk_names[i];
++	ret = devm_clk_bulk_get_optional(dev, ARRAY_SIZE(ic->clks), ic->clks);
++	if (ret)
++		return ret;
++
++	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &r);
++	if (!ret) {
++		ic->msa_pa = r.start;
++		ic->msa_size = resource_size(&r);
++		ic->msa_va = devm_memremap(dev, r.start, resource_size(&r),
++					   MEMREMAP_WT);
++		if (IS_ERR(ic->msa_va))
++			return PTR_ERR(ic->msa_va);
++	} else {
++		ic->msa_size = ICNSS_MSA_SIZE;
++		ic->msa_va = dmam_alloc_coherent(dev, ic->msa_size,
++						 &ic->msa_pa, GFP_KERNEL);
++		if (!ic->msa_va)
++			return -ENOMEM;
++	}
++	ic->msa_fixed_perm =
++		device_property_read_bool(dev, "qcom,msa-fixed-perm");
++	device_get_mac_address(dev, (char *)ic->mac_addr);
++
++	ic->wq = alloc_ordered_workqueue("icnss_clover", WQ_MEM_RECLAIM);
++	if (!ic->wq)
++		return -ENOMEM;
++	INIT_WORK(&ic->server_work, icnss_server_work);
++	INIT_WORK(&ic->bdf_work, icnss_bdf_work);
++	INIT_WORK(&ic->fw_ready_work, icnss_fw_ready_work);
++	INIT_WORK(&ic->server_exit_work, icnss_server_exit_work);
++	ret = qmi_handle_init(&ic->qmi,
++			      WLFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_MSG_LEN,
++			      &icnss_qmi_ops, icnss_qmi_handlers);
++	if (ret)
++		goto err_wq;
++	ic->qmi_initialized = true;
++	ret = qmi_add_lookup(&ic->qmi, WLFW_SERVICE_ID_V01,
++			     WLFW_SERVICE_VERS_V01, 0);
++	if (ret)
++		goto err_qmi;
++
++	mutex_lock(&icnss_global_lock);
++	if (icnss_global) {
++		mutex_unlock(&icnss_global_lock);
++		ret = -EBUSY;
++		goto err_qmi;
++	}
++	icnss_global = ic;
++	mutex_unlock(&icnss_global_lock);
++	dev_info(dev, "WCN3990 ICNSS/WLFW backend registered\n");
++	return 0;
++
++err_qmi:
++	qmi_handle_release(&ic->qmi);
++	ic->qmi_initialized = false;
++err_wq:
++	destroy_workqueue(ic->wq);
++	return ret;
++}
++
++static void icnss_clover_remove(struct platform_device *pdev)
++{
++	struct icnss_clover *ic = platform_get_drvdata(pdev);
++	int i;
++
++	mutex_lock(&ic->lock);
++	ic->removing = true;
++	mutex_unlock(&ic->lock);
++	mutex_lock(&icnss_global_lock);
++	if (icnss_global == ic)
++		icnss_global = NULL;
++	mutex_unlock(&icnss_global_lock);
++	if (ic->qmi_initialized)
++		qmi_handle_release(&ic->qmi);
++	cancel_work_sync(&ic->server_work);
++	cancel_work_sync(&ic->bdf_work);
++	cancel_work_sync(&ic->fw_ready_work);
++	cancel_work_sync(&ic->server_exit_work);
++	if (ic->driver_probed && ic->active_ops && ic->active_ops->remove)
++		ic->active_ops->remove(ic->dev);
++	for (i = 0; i < ARRAY_SIZE(ic->ce); i++)
++		if (ic->ce[i].requested)
++			free_irq(ic->ce[i].irq, ic->ce[i].ctx);
++	icnss_unassign_msa(ic);
++	icnss_hw_power_off(ic);
++	kfree(ic->dfs_nol);
++	destroy_workqueue(ic->wq);
++}
++
++static void icnss_clover_shutdown(struct platform_device *pdev)
++{
++	struct icnss_clover *ic = platform_get_drvdata(pdev);
++	struct icnss_driver_ops *ops;
++
++	mutex_lock(&ic->lock);
++	ops = ic->driver_probed ? ic->active_ops : NULL;
++	mutex_unlock(&ic->lock);
++	if (ops && ops->shutdown)
++		ops->shutdown(ic->dev);
++	icnss_hw_power_off(ic);
++}
++
++static int icnss_clover_pm_suspend(struct device *dev)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	struct icnss_driver_ops *ops;
++
++	mutex_lock(&ic->lock);
++	ops = ic->driver_probed ? ic->active_ops : NULL;
++	mutex_unlock(&ic->lock);
++	return ops && ops->pm_suspend ? ops->pm_suspend(dev) : 0;
++}
++
++static int icnss_clover_pm_resume(struct device *dev)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	struct icnss_driver_ops *ops;
++
++	mutex_lock(&ic->lock);
++	ops = ic->driver_probed ? ic->active_ops : NULL;
++	mutex_unlock(&ic->lock);
++	return ops && ops->pm_resume ? ops->pm_resume(dev) : 0;
++}
++
++static int icnss_clover_pm_suspend_noirq(struct device *dev)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	struct icnss_driver_ops *ops;
++
++	mutex_lock(&ic->lock);
++	ops = ic->driver_probed ? ic->active_ops : NULL;
++	mutex_unlock(&ic->lock);
++	return ops && ops->suspend_noirq ? ops->suspend_noirq(dev) : 0;
++}
++
++static int icnss_clover_pm_resume_noirq(struct device *dev)
++{
++	struct icnss_clover *ic = dev_get_drvdata(dev);
++	struct icnss_driver_ops *ops;
++
++	mutex_lock(&ic->lock);
++	ops = ic->driver_probed ? ic->active_ops : NULL;
++	mutex_unlock(&ic->lock);
++	return ops && ops->resume_noirq ? ops->resume_noirq(dev) : 0;
++}
++
++static const struct dev_pm_ops icnss_clover_pm_ops = {
++	.suspend = icnss_clover_pm_suspend,
++	.resume = icnss_clover_pm_resume,
++	.suspend_noirq = icnss_clover_pm_suspend_noirq,
++	.resume_noirq = icnss_clover_pm_resume_noirq,
++};
++
++static const struct of_device_id icnss_clover_of_match[] = {
++	{ .compatible = "qcom,wcn3990-wifi" },
++	{}
++};
++
++static struct platform_driver icnss_clover_driver = {
++	.probe = icnss_clover_probe,
++	.remove = icnss_clover_remove,
++	.shutdown = icnss_clover_shutdown,
++	.driver = {
++		.name = "icnss-clover",
++		.of_match_table = icnss_clover_of_match,
++		.pm = &icnss_clover_pm_ops,
++		.dev_groups = icnss_clover_groups,
++	},
++};
++module_platform_driver(icnss_clover_driver);
++
++MODULE_DESCRIPTION("Qualcomm WCN3990 ICNSS/WLFW backend for Xiaomi Clover");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/staging/qcom_icnss_clover/wlan_firmware_service_v01.c b/drivers/staging/qcom_icnss_clover/wlan_firmware_service_v01.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf4cff762dd2a49041251f803f2dbd7c4dca3cd6
+--- /dev/null
++++ b/drivers/staging/qcom_icnss_clover/wlan_firmware_service_v01.c
+@@ -0,0 +1,2309 @@
++// SPDX-License-Identifier: ISC
++/*
++ * Copyright (c) 2018 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/soc/qcom/qmi.h>
++#include <linux/types.h>
++#include "wlan_firmware_service_v01.h"
++
++static const struct qmi_elem_info wlfw_ce_tgt_pipe_cfg_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_tgt_pipe_cfg_s_v01,
++					   pipe_num),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_pipedir_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_tgt_pipe_cfg_s_v01,
++					   pipe_dir),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_tgt_pipe_cfg_s_v01,
++					   nentries),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_tgt_pipe_cfg_s_v01,
++					   nbytes_max),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_tgt_pipe_cfg_s_v01,
++					   flags),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_ce_svc_pipe_cfg_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_svc_pipe_cfg_s_v01,
++					   service_id),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_pipedir_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_svc_pipe_cfg_s_v01,
++					   pipe_dir),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_ce_svc_pipe_cfg_s_v01,
++					   pipe_num),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_shadow_reg_cfg_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_2_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_shadow_reg_cfg_s_v01,
++					   id),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_2_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_shadow_reg_cfg_s_v01,
++					   offset),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_shadow_reg_v2_cfg_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_shadow_reg_v2_cfg_s_v01,
++					   addr),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_memory_region_info_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_memory_region_info_s_v01,
++					   region_addr),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_memory_region_info_s_v01,
++					   size),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_memory_region_info_s_v01,
++					   secure_flag),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_mem_cfg_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_cfg_s_v01,
++					   offset),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_cfg_s_v01,
++					   size),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_cfg_s_v01,
++					   secure_flag),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_mem_seg_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_s_v01,
++					   size),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_mem_type_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_s_v01,
++					   type),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_s_v01,
++					   mem_cfg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_MEM_CFG_V01,
++		.elem_size      = sizeof(struct wlfw_mem_cfg_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_s_v01,
++					   mem_cfg),
++		.ei_array      = wlfw_mem_cfg_s_v01_ei,
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_mem_seg_resp_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_resp_s_v01,
++					   addr),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_resp_s_v01,
++					   size),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_mem_type_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_mem_seg_resp_s_v01,
++					   type),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_rf_chip_info_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_rf_chip_info_s_v01,
++					   chip_id),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_rf_chip_info_s_v01,
++					   chip_family),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_rf_board_info_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_rf_board_info_s_v01,
++					   board_id),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_soc_info_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_soc_info_s_v01,
++					   soc_id),
++	},
++	{}
++};
++
++static const struct qmi_elem_info wlfw_fw_version_info_s_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_fw_version_info_s_v01,
++					   fw_version),
++	},
++	{
++		.data_type      = QMI_STRING,
++		.elem_len       = QMI_WLFW_MAX_TIMESTAMP_LEN_V01 + 1,
++		.elem_size      = sizeof(char),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0,
++		.offset         = offsetof(struct wlfw_fw_version_info_s_v01,
++					   fw_build_timestamp),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_ind_register_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   fw_ready_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   fw_ready_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   initiate_cal_download_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   initiate_cal_download_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   initiate_cal_update_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   initiate_cal_update_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   msa_ready_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   msa_ready_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   pin_connect_result_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   pin_connect_result_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   client_id_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   client_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x16,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   request_mem_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x16,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   request_mem_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x17,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   mem_ready_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x17,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   mem_ready_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x18,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   fw_init_done_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x18,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   fw_init_done_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x19,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   rejuvenate_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x19,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   rejuvenate_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1A,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   xo_cal_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1A,
++		.offset         = offsetof(struct wlfw_ind_register_req_msg_v01,
++					   xo_cal_enable),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_ind_register_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_ind_register_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_ind_register_resp_msg_v01,
++					   fw_status_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_ind_register_resp_msg_v01,
++					   fw_status),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_fw_ready_ind_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_msa_ready_ind_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_pin_connect_result_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_pin_connect_result_ind_msg_v01,
++					   pwr_pin_result_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_pin_connect_result_ind_msg_v01,
++					   pwr_pin_result),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_pin_connect_result_ind_msg_v01,
++					   phy_io_pin_result_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_pin_connect_result_ind_msg_v01,
++					   phy_io_pin_result),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_pin_connect_result_ind_msg_v01,
++					   rf_pin_result_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_pin_connect_result_ind_msg_v01,
++					   rf_pin_result),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_wlan_mode_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_driver_mode_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_wlan_mode_req_msg_v01,
++					   mode),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_wlan_mode_req_msg_v01,
++					   hw_debug_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_wlan_mode_req_msg_v01,
++					   hw_debug),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_wlan_mode_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_wlan_mode_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_wlan_cfg_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   host_version_valid),
++	},
++	{
++		.data_type      = QMI_STRING,
++		.elem_len       = QMI_WLFW_MAX_STR_LEN_V01 + 1,
++		.elem_size      = sizeof(char),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   host_version),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   tgt_cfg_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   tgt_cfg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_CE_V01,
++		.elem_size      = sizeof(struct wlfw_ce_tgt_pipe_cfg_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   tgt_cfg),
++		.ei_array      = wlfw_ce_tgt_pipe_cfg_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   svc_cfg_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   svc_cfg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_SVC_V01,
++		.elem_size      = sizeof(struct wlfw_ce_svc_pipe_cfg_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   svc_cfg),
++		.ei_array      = wlfw_ce_svc_pipe_cfg_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   shadow_reg_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   shadow_reg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_SHADOW_REG_V01,
++		.elem_size      = sizeof(struct wlfw_shadow_reg_cfg_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   shadow_reg),
++		.ei_array      = wlfw_shadow_reg_cfg_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   shadow_reg_v2_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   shadow_reg_v2_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_SHADOW_REG_V2,
++		.elem_size      = sizeof(struct wlfw_shadow_reg_v2_cfg_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_wlan_cfg_req_msg_v01,
++					   shadow_reg_v2),
++		.ei_array      = wlfw_shadow_reg_v2_cfg_s_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_wlan_cfg_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_wlan_cfg_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cap_req_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_cap_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   chip_info_valid),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct wlfw_rf_chip_info_s_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   chip_info),
++		.ei_array      = wlfw_rf_chip_info_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   board_info_valid),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct wlfw_rf_board_info_s_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   board_info),
++		.ei_array      = wlfw_rf_board_info_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   soc_info_valid),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct wlfw_soc_info_s_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   soc_info),
++		.ei_array      = wlfw_soc_info_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   fw_version_info_valid),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct wlfw_fw_version_info_s_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   fw_version_info),
++		.ei_array      = wlfw_fw_version_info_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   fw_build_id_valid),
++	},
++	{
++		.data_type      = QMI_STRING,
++		.elem_len       = QMI_WLFW_MAX_BUILD_ID_LEN_V01 + 1,
++		.elem_size      = sizeof(char),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   fw_build_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   num_macs_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_cap_resp_msg_v01,
++					   num_macs),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_bdf_download_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   valid),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   file_id_valid),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   file_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   total_size_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   total_size),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   seg_id_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   seg_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   data_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   data_len),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = QMI_WLFW_MAX_DATA_SIZE_V01,
++		.elem_size      = sizeof(u8),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   data),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   end_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   end),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   bdf_type_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_bdf_download_req_msg_v01,
++					   bdf_type),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_bdf_download_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_bdf_download_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cal_report_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_cal_report_req_msg_v01,
++					   meta_data_len),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = QMI_WLFW_MAX_NUM_CAL_V01,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_cal_report_req_msg_v01,
++					   meta_data),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cal_report_req_msg_v01,
++					   xo_cal_data_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cal_report_req_msg_v01,
++					   xo_cal_data),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cal_report_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_cal_report_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_initiate_cal_download_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_initiate_cal_download_ind_msg_v01,
++					   cal_id),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cal_download_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   valid),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   file_id_valid),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   file_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   total_size_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   total_size),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   seg_id_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   seg_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   data_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   data_len),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = QMI_WLFW_MAX_DATA_SIZE_V01,
++		.elem_size      = sizeof(u8),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   data),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   end_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_cal_download_req_msg_v01,
++					   end),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cal_download_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_cal_download_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_initiate_cal_update_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_initiate_cal_update_ind_msg_v01,
++					   cal_id),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_initiate_cal_update_ind_msg_v01,
++					   total_size),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cal_update_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_cal_update_req_msg_v01,
++					   cal_id),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_cal_update_req_msg_v01,
++					   seg_id),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_cal_update_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   file_id_valid),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum wlfw_cal_temp_id_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   file_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   total_size_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   total_size),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   seg_id_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   seg_id),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   data_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   data_len),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = QMI_WLFW_MAX_DATA_SIZE_V01,
++		.elem_size      = sizeof(u8),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   data),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   end_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_cal_update_resp_msg_v01,
++					   end),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_msa_info_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_msa_info_req_msg_v01,
++					   msa_addr),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_msa_info_req_msg_v01,
++					   size),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_msa_info_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_msa_info_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x03,
++		.offset         = offsetof(struct wlfw_msa_info_resp_msg_v01,
++					   mem_region_info_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_MEM_REG_V01,
++		.elem_size      = sizeof(struct wlfw_memory_region_info_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x03,
++		.offset         = offsetof(struct wlfw_msa_info_resp_msg_v01,
++					   mem_region_info),
++		.ei_array      = wlfw_memory_region_info_s_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_msa_ready_req_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_msa_ready_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_msa_ready_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_ini_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_ini_req_msg_v01,
++					   enablefwlog_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_ini_req_msg_v01,
++					   enablefwlog),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_ini_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_ini_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_athdiag_read_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_athdiag_read_req_msg_v01,
++					   offset),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_athdiag_read_req_msg_v01,
++					   mem_type),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x03,
++		.offset         = offsetof(struct wlfw_athdiag_read_req_msg_v01,
++					   data_len),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_athdiag_read_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_athdiag_read_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_athdiag_read_resp_msg_v01,
++					   data_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_athdiag_read_resp_msg_v01,
++					   data_len),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01,
++		.elem_size      = sizeof(u8),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_athdiag_read_resp_msg_v01,
++					   data),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_athdiag_write_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_athdiag_write_req_msg_v01,
++					   offset),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_athdiag_write_req_msg_v01,
++					   mem_type),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x03,
++		.offset         = offsetof(struct wlfw_athdiag_write_req_msg_v01,
++					   data_len),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01,
++		.elem_size      = sizeof(u8),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x03,
++		.offset         = offsetof(struct wlfw_athdiag_write_req_msg_v01,
++					   data),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_athdiag_write_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_athdiag_write_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_vbatt_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_vbatt_req_msg_v01,
++					   voltage_uv),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_vbatt_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_vbatt_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_mac_addr_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_mac_addr_req_msg_v01,
++					   mac_addr_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = QMI_WLFW_MAC_ADDR_SIZE_V01,
++		.elem_size      = sizeof(u8),
++		.array_type       = STATIC_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_mac_addr_req_msg_v01,
++					   mac_addr),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_mac_addr_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_mac_addr_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_host_cap_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   daemon_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   daemon_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   wake_msi_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   wake_msi),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   gpios_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   gpios_len),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = QMI_WLFW_MAX_NUM_GPIO_V01,
++		.elem_size      = sizeof(u32),
++		.array_type     = VAR_LEN_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   gpios),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   nm_modem_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   nm_modem),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   bdf_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x14,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   bdf_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   bdf_cache_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x15,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   bdf_cache_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x16,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   m3_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x16,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   m3_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x17,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   m3_cache_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x17,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   m3_cache_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x18,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   cal_filesys_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x18,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   cal_filesys_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x19,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   cal_cache_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x19,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   cal_cache_support),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1A,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   cal_done_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1A,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   cal_done),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1B,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   mem_bucket_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1B,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   mem_bucket),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1C,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   mem_cfg_mode_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1C,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   mem_cfg_mode),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_host_cap_8bit_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   daemon_support_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_host_cap_req_msg_v01,
++					   daemon_support),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_host_cap_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_host_cap_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_request_mem_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_request_mem_ind_msg_v01,
++					   mem_seg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_MEM_SEG_V01,
++		.elem_size      = sizeof(struct wlfw_mem_seg_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_request_mem_ind_msg_v01,
++					   mem_seg),
++		.ei_array      = wlfw_mem_seg_s_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_respond_mem_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_respond_mem_req_msg_v01,
++					   mem_seg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_MEM_SEG_V01,
++		.elem_size      = sizeof(struct wlfw_mem_seg_resp_s_v01),
++		.array_type       = VAR_LEN_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_respond_mem_req_msg_v01,
++					   mem_seg),
++		.ei_array      = wlfw_mem_seg_resp_s_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_respond_mem_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_respond_mem_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_mem_ready_ind_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_fw_init_done_ind_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_rejuvenate_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   cause_for_rejuvenation_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   cause_for_rejuvenation),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   requesting_sub_system_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   requesting_sub_system),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   line_number_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_2_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u16),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x12,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   line_number),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   function_name_valid),
++	},
++	{
++		.data_type      = QMI_STRING,
++		.elem_len       = QMI_WLFW_FUNCTION_NAME_LEN_V01 + 1,
++		.elem_size      = sizeof(char),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x13,
++		.offset         = offsetof(struct wlfw_rejuvenate_ind_msg_v01,
++					   function_name),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_rejuvenate_ack_req_msg_v01_ei[] = {
++	{}
++};
++
++const struct qmi_elem_info wlfw_rejuvenate_ack_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_rejuvenate_ack_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_dynamic_feature_mask_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_req_msg_v01,
++					   mask_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_req_msg_v01,
++					   mask),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_dynamic_feature_mask_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_resp_msg_v01,
++					   prev_mask_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_resp_msg_v01,
++					   prev_mask),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_resp_msg_v01,
++					   curr_mask_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct wlfw_dynamic_feature_mask_resp_msg_v01,
++					   curr_mask),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_m3_info_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_m3_info_req_msg_v01,
++					   addr),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_m3_info_req_msg_v01,
++					   size),
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_m3_info_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct wlfw_m3_info_resp_msg_v01,
++					   resp),
++		.ei_array      = qmi_response_type_v01_ei,
++	},
++	{}
++};
++
++const struct qmi_elem_info wlfw_xo_cal_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct wlfw_xo_cal_ind_msg_v01,
++					   xo_cal_data),
++	},
++	{}
++};
+diff --git a/drivers/staging/qcom_icnss_clover/wlan_firmware_service_v01.h b/drivers/staging/qcom_icnss_clover/wlan_firmware_service_v01.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f311f3bc9e7f9eb20bfc83fa0f38a91a2c3a220
+--- /dev/null
++++ b/drivers/staging/qcom_icnss_clover/wlan_firmware_service_v01.h
+@@ -0,0 +1,694 @@
++/* SPDX-License-Identifier: ISC */
++/*
++ * Copyright (c) 2018 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef WCN3990_QMI_SVC_V01_H
++#define WCN3990_QMI_SVC_V01_H
++
++#define WLFW_SERVICE_ID_V01 0x45
++#define WLFW_SERVICE_VERS_V01 0x01
++
++#define QMI_WLFW_BDF_DOWNLOAD_REQ_V01 0x0025
++#define QMI_WLFW_MEM_READY_IND_V01 0x0037
++#define QMI_WLFW_DYNAMIC_FEATURE_MASK_RESP_V01 0x003B
++#define QMI_WLFW_INITIATE_CAL_UPDATE_IND_V01 0x002A
++#define QMI_WLFW_HOST_CAP_REQ_V01 0x0034
++#define QMI_WLFW_M3_INFO_REQ_V01 0x003C
++#define QMI_WLFW_CAP_REQ_V01 0x0024
++#define QMI_WLFW_FW_INIT_DONE_IND_V01 0x0038
++#define QMI_WLFW_CAL_REPORT_REQ_V01 0x0026
++#define QMI_WLFW_M3_INFO_RESP_V01 0x003C
++#define QMI_WLFW_CAL_UPDATE_RESP_V01 0x0029
++#define QMI_WLFW_CAL_DOWNLOAD_RESP_V01 0x0027
++#define QMI_WLFW_XO_CAL_IND_V01 0x003D
++#define QMI_WLFW_INI_RESP_V01 0x002F
++#define QMI_WLFW_CAL_REPORT_RESP_V01 0x0026
++#define QMI_WLFW_MAC_ADDR_RESP_V01 0x0033
++#define QMI_WLFW_INITIATE_CAL_DOWNLOAD_IND_V01 0x0028
++#define QMI_WLFW_HOST_CAP_RESP_V01 0x0034
++#define QMI_WLFW_MSA_READY_IND_V01 0x002B
++#define QMI_WLFW_ATHDIAG_WRITE_RESP_V01 0x0031
++#define QMI_WLFW_WLAN_MODE_REQ_V01 0x0022
++#define QMI_WLFW_IND_REGISTER_REQ_V01 0x0020
++#define QMI_WLFW_WLAN_CFG_RESP_V01 0x0023
++#define QMI_WLFW_REQUEST_MEM_IND_V01 0x0035
++#define QMI_WLFW_REJUVENATE_IND_V01 0x0039
++#define QMI_WLFW_DYNAMIC_FEATURE_MASK_REQ_V01 0x003B
++#define QMI_WLFW_ATHDIAG_WRITE_REQ_V01 0x0031
++#define QMI_WLFW_WLAN_MODE_RESP_V01 0x0022
++#define QMI_WLFW_RESPOND_MEM_REQ_V01 0x0036
++#define QMI_WLFW_PIN_CONNECT_RESULT_IND_V01 0x002C
++#define QMI_WLFW_FW_READY_IND_V01 0x0021
++#define QMI_WLFW_MSA_READY_RESP_V01 0x002E
++#define QMI_WLFW_CAL_UPDATE_REQ_V01 0x0029
++#define QMI_WLFW_INI_REQ_V01 0x002F
++#define QMI_WLFW_BDF_DOWNLOAD_RESP_V01 0x0025
++#define QMI_WLFW_REJUVENATE_ACK_RESP_V01 0x003A
++#define QMI_WLFW_MSA_INFO_RESP_V01 0x002D
++#define QMI_WLFW_MSA_READY_REQ_V01 0x002E
++#define QMI_WLFW_CAP_RESP_V01 0x0024
++#define QMI_WLFW_REJUVENATE_ACK_REQ_V01 0x003A
++#define QMI_WLFW_ATHDIAG_READ_RESP_V01 0x0030
++#define QMI_WLFW_VBATT_REQ_V01 0x0032
++#define QMI_WLFW_MAC_ADDR_REQ_V01 0x0033
++#define QMI_WLFW_RESPOND_MEM_RESP_V01 0x0036
++#define QMI_WLFW_VBATT_RESP_V01 0x0032
++#define QMI_WLFW_MSA_INFO_REQ_V01 0x002D
++#define QMI_WLFW_CAL_DOWNLOAD_REQ_V01 0x0027
++#define QMI_WLFW_ATHDIAG_READ_REQ_V01 0x0030
++#define QMI_WLFW_WLAN_CFG_REQ_V01 0x0023
++#define QMI_WLFW_IND_REGISTER_RESP_V01 0x0020
++
++#define QMI_WLFW_MAX_MEM_REG_V01 2
++#define QMI_WLFW_MAX_NUM_MEM_SEG_V01 16
++#define QMI_WLFW_MAX_NUM_CAL_V01 5
++#define QMI_WLFW_MAX_DATA_SIZE_V01 6144
++#define QMI_WLFW_FUNCTION_NAME_LEN_V01 128
++#define QMI_WLFW_MAX_NUM_CE_V01 12
++#define QMI_WLFW_MAX_TIMESTAMP_LEN_V01 32
++#define QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01 6144
++#define QMI_WLFW_MAX_NUM_GPIO_V01 32
++#define QMI_WLFW_MAX_BUILD_ID_LEN_V01 128
++#define QMI_WLFW_MAX_NUM_MEM_CFG_V01 2
++#define QMI_WLFW_MAX_STR_LEN_V01 16
++#define QMI_WLFW_MAX_NUM_SHADOW_REG_V01 24
++#define QMI_WLFW_MAC_ADDR_SIZE_V01 6
++#define QMI_WLFW_MAX_SHADOW_REG_V2 36
++#define QMI_WLFW_MAX_NUM_SVC_V01 24
++
++enum wlfw_driver_mode_enum_v01 {
++	QMI_WLFW_MISSION_V01 = 0,
++	QMI_WLFW_FTM_V01 = 1,
++	QMI_WLFW_EPPING_V01 = 2,
++	QMI_WLFW_WALTEST_V01 = 3,
++	QMI_WLFW_OFF_V01 = 4,
++	QMI_WLFW_CCPM_V01 = 5,
++	QMI_WLFW_QVIT_V01 = 6,
++	QMI_WLFW_CALIBRATION_V01 = 7,
++};
++
++enum wlfw_cal_temp_id_enum_v01 {
++	QMI_WLFW_CAL_TEMP_IDX_0_V01 = 0,
++	QMI_WLFW_CAL_TEMP_IDX_1_V01 = 1,
++	QMI_WLFW_CAL_TEMP_IDX_2_V01 = 2,
++	QMI_WLFW_CAL_TEMP_IDX_3_V01 = 3,
++	QMI_WLFW_CAL_TEMP_IDX_4_V01 = 4,
++};
++
++enum wlfw_pipedir_enum_v01 {
++	QMI_WLFW_PIPEDIR_NONE_V01 = 0,
++	QMI_WLFW_PIPEDIR_IN_V01 = 1,
++	QMI_WLFW_PIPEDIR_OUT_V01 = 2,
++	QMI_WLFW_PIPEDIR_INOUT_V01 = 3,
++};
++
++enum wlfw_mem_type_enum_v01 {
++	QMI_WLFW_MEM_TYPE_MSA_V01 = 0,
++	QMI_WLFW_MEM_TYPE_DDR_V01 = 1,
++};
++
++#define QMI_WLFW_CE_ATTR_FLAGS_V01 ((u32)0x00)
++#define QMI_WLFW_CE_ATTR_NO_SNOOP_V01 ((u32)0x01)
++#define QMI_WLFW_CE_ATTR_BYTE_SWAP_DATA_V01 ((u32)0x02)
++#define QMI_WLFW_CE_ATTR_SWIZZLE_DESCRIPTORS_V01 ((u32)0x04)
++#define QMI_WLFW_CE_ATTR_DISABLE_INTR_V01 ((u32)0x08)
++#define QMI_WLFW_CE_ATTR_ENABLE_POLL_V01 ((u32)0x10)
++
++#define QMI_WLFW_ALREADY_REGISTERED_V01 ((u64)0x01ULL)
++#define QMI_WLFW_FW_READY_V01 ((u64)0x02ULL)
++#define QMI_WLFW_MSA_READY_V01 ((u64)0x04ULL)
++#define QMI_WLFW_MEM_READY_V01 ((u64)0x08ULL)
++#define QMI_WLFW_FW_INIT_DONE_V01 ((u64)0x10ULL)
++
++#define QMI_WLFW_FW_REJUVENATE_V01 ((u64)0x01ULL)
++
++struct wlfw_ce_tgt_pipe_cfg_s_v01 {
++	__le32 pipe_num;
++	__le32 pipe_dir;
++	__le32 nentries;
++	__le32 nbytes_max;
++	__le32 flags;
++};
++
++struct wlfw_ce_svc_pipe_cfg_s_v01 {
++	__le32 service_id;
++	__le32 pipe_dir;
++	__le32 pipe_num;
++};
++
++struct wlfw_shadow_reg_cfg_s_v01 {
++	u16 id;
++	u16 offset;
++};
++
++struct wlfw_shadow_reg_v2_cfg_s_v01 {
++	u32 addr;
++};
++
++struct wlfw_memory_region_info_s_v01 {
++	u64 region_addr;
++	u32 size;
++	u8 secure_flag;
++};
++
++struct wlfw_mem_cfg_s_v01 {
++	u64 offset;
++	u32 size;
++	u8 secure_flag;
++};
++
++struct wlfw_mem_seg_s_v01 {
++	u32 size;
++	enum wlfw_mem_type_enum_v01 type;
++	u32 mem_cfg_len;
++	struct wlfw_mem_cfg_s_v01 mem_cfg[QMI_WLFW_MAX_NUM_MEM_CFG_V01];
++};
++
++struct wlfw_mem_seg_resp_s_v01 {
++	u64 addr;
++	u32 size;
++	enum wlfw_mem_type_enum_v01 type;
++};
++
++struct wlfw_rf_chip_info_s_v01 {
++	u32 chip_id;
++	u32 chip_family;
++};
++
++struct wlfw_rf_board_info_s_v01 {
++	u32 board_id;
++};
++
++struct wlfw_soc_info_s_v01 {
++	u32 soc_id;
++};
++
++struct wlfw_fw_version_info_s_v01 {
++	u32 fw_version;
++	char fw_build_timestamp[QMI_WLFW_MAX_TIMESTAMP_LEN_V01 + 1];
++};
++
++struct wlfw_ind_register_req_msg_v01 {
++	u8 fw_ready_enable_valid;
++	u8 fw_ready_enable;
++	u8 initiate_cal_download_enable_valid;
++	u8 initiate_cal_download_enable;
++	u8 initiate_cal_update_enable_valid;
++	u8 initiate_cal_update_enable;
++	u8 msa_ready_enable_valid;
++	u8 msa_ready_enable;
++	u8 pin_connect_result_enable_valid;
++	u8 pin_connect_result_enable;
++	u8 client_id_valid;
++	u32 client_id;
++	u8 request_mem_enable_valid;
++	u8 request_mem_enable;
++	u8 mem_ready_enable_valid;
++	u8 mem_ready_enable;
++	u8 fw_init_done_enable_valid;
++	u8 fw_init_done_enable;
++	u8 rejuvenate_enable_valid;
++	u32 rejuvenate_enable;
++	u8 xo_cal_enable_valid;
++	u8 xo_cal_enable;
++};
++
++#define WLFW_IND_REGISTER_REQ_MSG_V01_MAX_MSG_LEN 50
++extern const struct qmi_elem_info wlfw_ind_register_req_msg_v01_ei[];
++
++struct wlfw_ind_register_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u8 fw_status_valid;
++	u64 fw_status;
++};
++
++#define WLFW_IND_REGISTER_RESP_MSG_V01_MAX_MSG_LEN 18
++extern const struct qmi_elem_info wlfw_ind_register_resp_msg_v01_ei[];
++
++struct wlfw_fw_ready_ind_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_FW_READY_IND_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_fw_ready_ind_msg_v01_ei[];
++
++struct wlfw_msa_ready_ind_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_MSA_READY_IND_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_msa_ready_ind_msg_v01_ei[];
++
++struct wlfw_pin_connect_result_ind_msg_v01 {
++	u8 pwr_pin_result_valid;
++	u32 pwr_pin_result;
++	u8 phy_io_pin_result_valid;
++	u32 phy_io_pin_result;
++	u8 rf_pin_result_valid;
++	u32 rf_pin_result;
++};
++
++#define WLFW_PIN_CONNECT_RESULT_IND_MSG_V01_MAX_MSG_LEN 21
++extern const struct qmi_elem_info wlfw_pin_connect_result_ind_msg_v01_ei[];
++
++struct wlfw_wlan_mode_req_msg_v01 {
++	enum wlfw_driver_mode_enum_v01 mode;
++	u8 hw_debug_valid;
++	u8 hw_debug;
++};
++
++#define WLFW_WLAN_MODE_REQ_MSG_V01_MAX_MSG_LEN 11
++extern const struct qmi_elem_info wlfw_wlan_mode_req_msg_v01_ei[];
++
++struct wlfw_wlan_mode_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_WLAN_MODE_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_wlan_mode_resp_msg_v01_ei[];
++
++struct wlfw_wlan_cfg_req_msg_v01 {
++	u8 host_version_valid;
++	char host_version[QMI_WLFW_MAX_STR_LEN_V01 + 1];
++	u8 tgt_cfg_valid;
++	u32 tgt_cfg_len;
++	struct wlfw_ce_tgt_pipe_cfg_s_v01 tgt_cfg[QMI_WLFW_MAX_NUM_CE_V01];
++	u8 svc_cfg_valid;
++	u32 svc_cfg_len;
++	struct wlfw_ce_svc_pipe_cfg_s_v01 svc_cfg[QMI_WLFW_MAX_NUM_SVC_V01];
++	u8 shadow_reg_valid;
++	u32 shadow_reg_len;
++	struct wlfw_shadow_reg_cfg_s_v01 shadow_reg[QMI_WLFW_MAX_NUM_SHADOW_REG_V01];
++	u8 shadow_reg_v2_valid;
++	u32 shadow_reg_v2_len;
++	struct wlfw_shadow_reg_v2_cfg_s_v01 shadow_reg_v2[QMI_WLFW_MAX_SHADOW_REG_V2];
++};
++
++#define WLFW_WLAN_CFG_REQ_MSG_V01_MAX_MSG_LEN 803
++extern const struct qmi_elem_info wlfw_wlan_cfg_req_msg_v01_ei[];
++
++struct wlfw_wlan_cfg_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_WLAN_CFG_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_wlan_cfg_resp_msg_v01_ei[];
++
++struct wlfw_cap_req_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_CAP_REQ_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_cap_req_msg_v01_ei[];
++
++struct wlfw_cap_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u8 chip_info_valid;
++	struct wlfw_rf_chip_info_s_v01 chip_info;
++	u8 board_info_valid;
++	struct wlfw_rf_board_info_s_v01 board_info;
++	u8 soc_info_valid;
++	struct wlfw_soc_info_s_v01 soc_info;
++	u8 fw_version_info_valid;
++	struct wlfw_fw_version_info_s_v01 fw_version_info;
++	u8 fw_build_id_valid;
++	char fw_build_id[QMI_WLFW_MAX_BUILD_ID_LEN_V01 + 1];
++	u8 num_macs_valid;
++	u8 num_macs;
++};
++
++#define WLFW_CAP_RESP_MSG_V01_MAX_MSG_LEN 207
++extern const struct qmi_elem_info wlfw_cap_resp_msg_v01_ei[];
++
++struct wlfw_bdf_download_req_msg_v01 {
++	u8 valid;
++	u8 file_id_valid;
++	enum wlfw_cal_temp_id_enum_v01 file_id;
++	u8 total_size_valid;
++	u32 total_size;
++	u8 seg_id_valid;
++	u32 seg_id;
++	u8 data_valid;
++	u32 data_len;
++	u8 data[QMI_WLFW_MAX_DATA_SIZE_V01];
++	u8 end_valid;
++	u8 end;
++	u8 bdf_type_valid;
++	u8 bdf_type;
++};
++
++#define WLFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_MSG_LEN 6182
++extern const struct qmi_elem_info wlfw_bdf_download_req_msg_v01_ei[];
++
++struct wlfw_bdf_download_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_BDF_DOWNLOAD_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_bdf_download_resp_msg_v01_ei[];
++
++struct wlfw_cal_report_req_msg_v01 {
++	u32 meta_data_len;
++	enum wlfw_cal_temp_id_enum_v01 meta_data[QMI_WLFW_MAX_NUM_CAL_V01];
++	u8 xo_cal_data_valid;
++	u8 xo_cal_data;
++};
++
++#define WLFW_CAL_REPORT_REQ_MSG_V01_MAX_MSG_LEN 28
++extern const struct qmi_elem_info wlfw_cal_report_req_msg_v01_ei[];
++
++struct wlfw_cal_report_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_CAL_REPORT_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_cal_report_resp_msg_v01_ei[];
++
++struct wlfw_initiate_cal_download_ind_msg_v01 {
++	enum wlfw_cal_temp_id_enum_v01 cal_id;
++};
++
++#define WLFW_INITIATE_CAL_DOWNLOAD_IND_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_initiate_cal_download_ind_msg_v01_ei[];
++
++struct wlfw_cal_download_req_msg_v01 {
++	u8 valid;
++	u8 file_id_valid;
++	enum wlfw_cal_temp_id_enum_v01 file_id;
++	u8 total_size_valid;
++	u32 total_size;
++	u8 seg_id_valid;
++	u32 seg_id;
++	u8 data_valid;
++	u32 data_len;
++	u8 data[QMI_WLFW_MAX_DATA_SIZE_V01];
++	u8 end_valid;
++	u8 end;
++};
++
++#define WLFW_CAL_DOWNLOAD_REQ_MSG_V01_MAX_MSG_LEN 6178
++extern const struct qmi_elem_info wlfw_cal_download_req_msg_v01_ei[];
++
++struct wlfw_cal_download_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_CAL_DOWNLOAD_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_cal_download_resp_msg_v01_ei[];
++
++struct wlfw_initiate_cal_update_ind_msg_v01 {
++	enum wlfw_cal_temp_id_enum_v01 cal_id;
++	u32 total_size;
++};
++
++#define WLFW_INITIATE_CAL_UPDATE_IND_MSG_V01_MAX_MSG_LEN 14
++extern const struct qmi_elem_info wlfw_initiate_cal_update_ind_msg_v01_ei[];
++
++struct wlfw_cal_update_req_msg_v01 {
++	enum wlfw_cal_temp_id_enum_v01 cal_id;
++	u32 seg_id;
++};
++
++#define WLFW_CAL_UPDATE_REQ_MSG_V01_MAX_MSG_LEN 14
++extern const struct qmi_elem_info wlfw_cal_update_req_msg_v01_ei[];
++
++struct wlfw_cal_update_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u8 file_id_valid;
++	enum wlfw_cal_temp_id_enum_v01 file_id;
++	u8 total_size_valid;
++	u32 total_size;
++	u8 seg_id_valid;
++	u32 seg_id;
++	u8 data_valid;
++	u32 data_len;
++	u8 data[QMI_WLFW_MAX_DATA_SIZE_V01];
++	u8 end_valid;
++	u8 end;
++};
++
++#define WLFW_CAL_UPDATE_RESP_MSG_V01_MAX_MSG_LEN 6181
++extern const struct qmi_elem_info wlfw_cal_update_resp_msg_v01_ei[];
++
++struct wlfw_msa_info_req_msg_v01 {
++	u64 msa_addr;
++	u32 size;
++};
++
++#define WLFW_MSA_INFO_REQ_MSG_V01_MAX_MSG_LEN 18
++extern const struct qmi_elem_info wlfw_msa_info_req_msg_v01_ei[];
++
++struct wlfw_msa_info_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u32 mem_region_info_len;
++	struct wlfw_memory_region_info_s_v01 mem_region_info[QMI_WLFW_MAX_MEM_REG_V01];
++};
++
++#define WLFW_MSA_INFO_RESP_MSG_V01_MAX_MSG_LEN 37
++extern const struct qmi_elem_info wlfw_msa_info_resp_msg_v01_ei[];
++
++struct wlfw_msa_ready_req_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_MSA_READY_REQ_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_msa_ready_req_msg_v01_ei[];
++
++struct wlfw_msa_ready_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_MSA_READY_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_msa_ready_resp_msg_v01_ei[];
++
++struct wlfw_ini_req_msg_v01 {
++	u8 enablefwlog_valid;
++	u8 enablefwlog;
++};
++
++#define WLFW_INI_REQ_MSG_V01_MAX_MSG_LEN 4
++extern const struct qmi_elem_info wlfw_ini_req_msg_v01_ei[];
++
++struct wlfw_ini_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_INI_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_ini_resp_msg_v01_ei[];
++
++struct wlfw_athdiag_read_req_msg_v01 {
++	u32 offset;
++	u32 mem_type;
++	u32 data_len;
++};
++
++#define WLFW_ATHDIAG_READ_REQ_MSG_V01_MAX_MSG_LEN 21
++extern const struct qmi_elem_info wlfw_athdiag_read_req_msg_v01_ei[];
++
++struct wlfw_athdiag_read_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u8 data_valid;
++	u32 data_len;
++	u8 data[QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01];
++};
++
++#define WLFW_ATHDIAG_READ_RESP_MSG_V01_MAX_MSG_LEN 6156
++extern const struct qmi_elem_info wlfw_athdiag_read_resp_msg_v01_ei[];
++
++struct wlfw_athdiag_write_req_msg_v01 {
++	u32 offset;
++	u32 mem_type;
++	u32 data_len;
++	u8 data[QMI_WLFW_MAX_ATHDIAG_DATA_SIZE_V01];
++};
++
++#define WLFW_ATHDIAG_WRITE_REQ_MSG_V01_MAX_MSG_LEN 6163
++extern const struct qmi_elem_info wlfw_athdiag_write_req_msg_v01_ei[];
++
++struct wlfw_athdiag_write_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_ATHDIAG_WRITE_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_athdiag_write_resp_msg_v01_ei[];
++
++struct wlfw_vbatt_req_msg_v01 {
++	u64 voltage_uv;
++};
++
++#define WLFW_VBATT_REQ_MSG_V01_MAX_MSG_LEN 11
++extern const struct qmi_elem_info wlfw_vbatt_req_msg_v01_ei[];
++
++struct wlfw_vbatt_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_VBATT_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_vbatt_resp_msg_v01_ei[];
++
++struct wlfw_mac_addr_req_msg_v01 {
++	u8 mac_addr_valid;
++	u8 mac_addr[QMI_WLFW_MAC_ADDR_SIZE_V01];
++};
++
++#define WLFW_MAC_ADDR_REQ_MSG_V01_MAX_MSG_LEN 9
++extern const struct qmi_elem_info wlfw_mac_addr_req_msg_v01_ei[];
++
++struct wlfw_mac_addr_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_MAC_ADDR_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_mac_addr_resp_msg_v01_ei[];
++
++#define QMI_WLFW_MAX_NUM_GPIO_V01 32
++struct wlfw_host_cap_req_msg_v01 {
++	u8 daemon_support_valid;
++	u32 daemon_support;
++	u8 wake_msi_valid;
++	u32 wake_msi;
++	u8 gpios_valid;
++	u32 gpios_len;
++	u32 gpios[QMI_WLFW_MAX_NUM_GPIO_V01];
++	u8 nm_modem_valid;
++	u8 nm_modem;
++	u8 bdf_support_valid;
++	u8 bdf_support;
++	u8 bdf_cache_support_valid;
++	u8 bdf_cache_support;
++	u8 m3_support_valid;
++	u8 m3_support;
++	u8 m3_cache_support_valid;
++	u8 m3_cache_support;
++	u8 cal_filesys_support_valid;
++	u8 cal_filesys_support;
++	u8 cal_cache_support_valid;
++	u8 cal_cache_support;
++	u8 cal_done_valid;
++	u8 cal_done;
++	u8 mem_bucket_valid;
++	u32 mem_bucket;
++	u8 mem_cfg_mode_valid;
++	u8 mem_cfg_mode;
++};
++
++#define WLFW_HOST_CAP_REQ_MSG_V01_MAX_MSG_LEN 189
++extern const struct qmi_elem_info wlfw_host_cap_req_msg_v01_ei[];
++extern const struct qmi_elem_info wlfw_host_cap_8bit_req_msg_v01_ei[];
++
++struct wlfw_host_cap_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_HOST_CAP_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_host_cap_resp_msg_v01_ei[];
++
++struct wlfw_request_mem_ind_msg_v01 {
++	u32 mem_seg_len;
++	struct wlfw_mem_seg_s_v01 mem_seg[QMI_WLFW_MAX_NUM_MEM_SEG_V01];
++};
++
++#define WLFW_REQUEST_MEM_IND_MSG_V01_MAX_MSG_LEN 564
++extern const struct qmi_elem_info wlfw_request_mem_ind_msg_v01_ei[];
++
++struct wlfw_respond_mem_req_msg_v01 {
++	u32 mem_seg_len;
++	struct wlfw_mem_seg_resp_s_v01 mem_seg[QMI_WLFW_MAX_NUM_MEM_SEG_V01];
++};
++
++#define WLFW_RESPOND_MEM_REQ_MSG_V01_MAX_MSG_LEN 260
++extern const struct qmi_elem_info wlfw_respond_mem_req_msg_v01_ei[];
++
++struct wlfw_respond_mem_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_RESPOND_MEM_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_respond_mem_resp_msg_v01_ei[];
++
++struct wlfw_mem_ready_ind_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_MEM_READY_IND_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_mem_ready_ind_msg_v01_ei[];
++
++struct wlfw_fw_init_done_ind_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_FW_INIT_DONE_IND_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_fw_init_done_ind_msg_v01_ei[];
++
++struct wlfw_rejuvenate_ind_msg_v01 {
++	u8 cause_for_rejuvenation_valid;
++	u8 cause_for_rejuvenation;
++	u8 requesting_sub_system_valid;
++	u8 requesting_sub_system;
++	u8 line_number_valid;
++	u16 line_number;
++	u8 function_name_valid;
++	char function_name[QMI_WLFW_FUNCTION_NAME_LEN_V01 + 1];
++};
++
++#define WLFW_REJUVENATE_IND_MSG_V01_MAX_MSG_LEN 144
++extern const struct qmi_elem_info wlfw_rejuvenate_ind_msg_v01_ei[];
++
++struct wlfw_rejuvenate_ack_req_msg_v01 {
++	char placeholder;
++};
++
++#define WLFW_REJUVENATE_ACK_REQ_MSG_V01_MAX_MSG_LEN 0
++extern const struct qmi_elem_info wlfw_rejuvenate_ack_req_msg_v01_ei[];
++
++struct wlfw_rejuvenate_ack_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_REJUVENATE_ACK_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_rejuvenate_ack_resp_msg_v01_ei[];
++
++struct wlfw_dynamic_feature_mask_req_msg_v01 {
++	u8 mask_valid;
++	u64 mask;
++};
++
++#define WLFW_DYNAMIC_FEATURE_MASK_REQ_MSG_V01_MAX_MSG_LEN 11
++extern const struct qmi_elem_info wlfw_dynamic_feature_mask_req_msg_v01_ei[];
++
++struct wlfw_dynamic_feature_mask_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u8 prev_mask_valid;
++	u64 prev_mask;
++	u8 curr_mask_valid;
++	u64 curr_mask;
++};
++
++#define WLFW_DYNAMIC_FEATURE_MASK_RESP_MSG_V01_MAX_MSG_LEN 29
++extern const struct qmi_elem_info wlfw_dynamic_feature_mask_resp_msg_v01_ei[];
++
++struct wlfw_m3_info_req_msg_v01 {
++	u64 addr;
++	u32 size;
++};
++
++#define WLFW_M3_INFO_REQ_MSG_V01_MAX_MSG_LEN 18
++extern const struct qmi_elem_info wlfw_m3_info_req_msg_v01_ei[];
++
++struct wlfw_m3_info_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++#define WLFW_M3_INFO_RESP_MSG_V01_MAX_MSG_LEN 7
++extern const struct qmi_elem_info wlfw_m3_info_resp_msg_v01_ei[];
++
++struct wlfw_xo_cal_ind_msg_v01 {
++	u8 xo_cal_data;
++};
++
++#define WLFW_XO_CAL_IND_MSG_V01_MAX_MSG_LEN 4
++extern const struct qmi_elem_info wlfw_xo_cal_ind_msg_v01_ei[];
++
++#endif
+diff --git a/include/soc/qcom/icnss.h b/include/soc/qcom/icnss.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3022253bc9e1f8feba76e616597b5d6741cacc85
+--- /dev/null
++++ b/include/soc/qcom/icnss.h
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ICNSS_WLAN_H_
++#define _ICNSS_WLAN_H_
++
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/types.h>
++
++struct dma_iommu_mapping;
++
++#define ICNSS_MAX_IRQ_REGISTRATIONS 12
++#define ICNSS_MAX_TIMESTAMP_LEN 32
++#define ICNSS_API_WITH_DEV
++
++enum icnss_uevent {
++	ICNSS_UEVENT_FW_READY,
++	ICNSS_UEVENT_FW_CRASHED,
++	ICNSS_UEVENT_FW_DOWN,
++};
++
++enum cnss_cc_src {
++	CNSS_SOURCE_CORE,
++	CNSS_SOURCE_11D,
++	CNSS_SOURCE_USER,
++};
++
++struct icnss_uevent_fw_down_data {
++	bool crashed;
++};
++
++struct icnss_uevent_data {
++	enum icnss_uevent uevent;
++	void *data;
++};
++
++struct icnss_driver_ops {
++	char *name;
++	unsigned long drv_state;
++	struct device_driver driver;
++	int (*probe)(struct device *dev);
++	void (*remove)(struct device *dev);
++	void (*shutdown)(struct device *dev);
++	int (*reinit)(struct device *dev);
++	void (*crash_shutdown)(void *pdev);
++	int (*pm_suspend)(struct device *dev);
++	int (*pm_resume)(struct device *dev);
++	int (*suspend_noirq)(struct device *dev);
++	int (*resume_noirq)(struct device *dev);
++	int (*uevent)(struct device *dev, struct icnss_uevent_data *uevent);
++};
++
++struct ce_tgt_pipe_cfg {
++	u32 pipe_num;
++	u32 pipe_dir;
++	u32 nentries;
++	u32 nbytes_max;
++	u32 flags;
++	u32 reserved;
++};
++
++struct ce_svc_pipe_cfg {
++	u32 service_id;
++	u32 pipe_dir;
++	u32 pipe_num;
++};
++
++struct icnss_shadow_reg_cfg {
++	u16 ce_id;
++	u16 reg_offset;
++};
++
++struct icnss_wlan_enable_cfg {
++	u32 num_ce_tgt_cfg;
++	struct ce_tgt_pipe_cfg *ce_tgt_cfg;
++	u32 num_ce_svc_pipe_cfg;
++	struct ce_svc_pipe_cfg *ce_svc_cfg;
++	u32 num_shadow_reg_cfg;
++	struct icnss_shadow_reg_cfg *shadow_reg_cfg;
++};
++
++enum icnss_driver_mode {
++	ICNSS_MISSION,
++	ICNSS_FTM,
++	ICNSS_EPPING,
++	ICNSS_WALTEST,
++	ICNSS_OFF,
++	ICNSS_CCPM,
++	ICNSS_QVIT,
++};
++
++struct icnss_soc_info {
++	void __iomem *v_addr;
++	phys_addr_t p_addr;
++	u32 chip_id;
++	u32 chip_family;
++	u32 board_id;
++	u32 soc_id;
++	u32 fw_version;
++	char fw_build_timestamp[ICNSS_MAX_TIMESTAMP_LEN + 1];
++};
++
++#define icnss_register_driver(ops) \
++	__icnss_register_driver(ops, THIS_MODULE, KBUILD_MODNAME)
++int __icnss_register_driver(struct icnss_driver_ops *ops,
++				    struct module *owner, const char *mod_name);
++int icnss_unregister_driver(struct icnss_driver_ops *ops);
++int icnss_wlan_enable(struct device *dev, struct icnss_wlan_enable_cfg *cfg,
++		       enum icnss_driver_mode mode, const char *host_version);
++int icnss_wlan_disable(struct device *dev, enum icnss_driver_mode mode);
++void icnss_enable_irq(struct device *dev, unsigned int ce_id);
++void icnss_disable_irq(struct device *dev, unsigned int ce_id);
++int icnss_get_soc_info(struct device *dev, struct icnss_soc_info *info);
++int icnss_ce_free_irq(struct device *dev, unsigned int ce_id, void *ctx);
++int icnss_ce_request_irq(struct device *dev, unsigned int ce_id,
++		 irqreturn_t (*handler)(int, void *), unsigned long flags,
++		 const char *name, void *ctx);
++int icnss_get_ce_id(struct device *dev, int irq);
++int icnss_set_fw_log_mode(struct device *dev, u8 fw_log_mode);
++int icnss_athdiag_read(struct device *dev, u32 offset, u32 mem_type,
++		     u32 data_len, u8 *output);
++int icnss_athdiag_write(struct device *dev, u32 offset, u32 mem_type,
++		      u32 data_len, u8 *input);
++int icnss_get_irq(struct device *dev, int ce_id);
++int icnss_power_on(struct device *dev);
++int icnss_power_off(struct device *dev);
++struct dma_iommu_mapping *icnss_smmu_get_mapping(struct device *dev);
++int icnss_smmu_map(struct device *dev, phys_addr_t paddr, u32 *iova_addr,
++		    size_t size);
++unsigned int icnss_socinfo_get_serial_number(struct device *dev);
++int icnss_set_wlan_unsafe_channel(u16 *unsafe_ch_list, u16 ch_count);
++int icnss_get_wlan_unsafe_channel(u16 *unsafe_ch_list, u16 *ch_count,
++				   u16 buf_len);
++int icnss_wlan_set_dfs_nol(const void *info, u16 info_len);
++int icnss_wlan_get_dfs_nol(void *info, u16 info_len);
++bool icnss_is_qmi_disable(struct device *dev);
++u8 *icnss_get_wlan_mac_address(struct device *dev, u32 *num);
++int icnss_trigger_recovery(struct device *dev);
++void cnss_set_cc_source(enum cnss_cc_src cc_source);
++enum cnss_cc_src cnss_get_cc_source(void);
++void icnss_set_cc_source(enum cnss_cc_src cc_source);
++enum cnss_cc_src icnss_get_cc_source(void);
++int icnss_get_driver_load_cnt(void);
++void icnss_increment_driver_load_cnt(void);
++
++#endif /* _ICNSS_WLAN_H_ */
