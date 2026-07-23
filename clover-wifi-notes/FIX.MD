@@ -9,6 +9,10 @@ driver-experiment history.
 - Kernel package: `linux-postmarketos-qcom-sdm660` `6.19.10-r4`.
 - Xiaomi WLAN source commit:
   `728ac0be7512264ecdc3bf885a19c581c6890c17`.
+- Firmware package: `firmware-xiaomi-clover` `2-r1`, based on the current
+  `setotau` source commit `c850ad5d11315e690df8244670241e3d5a8436dc`.
+- The firmware package retains the QCACLD `bdwlan.bin` extraction and includes
+  `goodix_9110_cfg.bin` in the initramfs file list.
 - QCACLD is the default Wi-Fi driver for Clover.
 - The tested installation does not load the ath10k driver.
 - `wlan.ko.zst` depends on `qcom-icnss-clover.ko.zst`.
@@ -109,11 +113,14 @@ Cold-boot results:
 | --- | --- |
 | `linux-postmarketos-qcom-sdm660-6.19.10-r4.apk` | `4744524782b553287159d72d1eec76d1c0c48b434dfd2d7edb2f7381f88729ac` |
 | `device-xiaomi-clover-11-r2.apk` | `79ce57cb3e468cf17d194d134150f5a640023a164ede6e8e547e5d657e10fed6` |
-| `device-xiaomi-clover-11-r3.apk` | `7cee461916be8b35e72939864c4d1310d3a738dc4a273d8c958094f88ebb0655` |
-| `firmware-xiaomi-clover-1-r1.apk` | `3217b61d890209001dd51722efa259a7676f2c9888bd76c82cec66466fb51204` |
+| `device-xiaomi-clover-11-r3.apk` | `e7cf0a25871c05250743894c7e1b9b64f15bfdc5eb7351fb406f8e6581301564` |
+| `firmware-xiaomi-clover-2-r1.apk` | `a53211d94d055e51528697002f8fa9d8e9231c49e5ec96640a98ae6c65d05745` |
 
 The `r2` device package is the hardware-tested functional package. Device
-package `r3` changes comments only and has the same runtime configuration.
+package `r3` changes comments and package metadata only and has the same
+runtime configuration. Firmware `2-r1` passed checksum, package-build, and APK
+content validation; its `board-2.bin` payload is byte-identical to the
+hardware-tested revision.
 
 ## Known limitations
 

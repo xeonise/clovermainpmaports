@@ -1,4 +1,5 @@
-# Maintainer: Caleb Connolly <caleb@connolly.tech>
+# Kernel config based on: arch/arm64/configs/sdm660_defconfig
+maintainer="Alexey Minnekhanov <alexeymin@postmarketos.org>"
 _flavor="postmarketos-qcom-sdm660"
 pkgname=linux-$_flavor
 pkgver=6.19.10
@@ -6,7 +7,7 @@ pkgrel=4
 pkgdesc="Mainline kernel fork for Qualcomm SDM660 devices"
 arch="aarch64"
 _carch="arm64"
-url="https://gitlab.com/sdm670-mainline/linux"
+url="https://github.com/sdm660-mainline/linux"
 license="GPL-2.0-only"
 makedepends="
 	bash

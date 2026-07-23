@@ -12,7 +12,7 @@ The main source changes are in:
   configuration, NetworkManager defaults, MAC handling, and driver loading;
 - `device/testing/firmware-xiaomi-clover/` — Clover WLAN firmware packaging.
 
-`clover-wifi-notes/FIX.MD` contains the development and hardware-test handoff.
+`clover-wifi-notes/FIX.MD` documents the final implementation and validation.
 `clover-wifi-tools/` contains the retained test and build helpers.
 
 Compiled kernels, APKs, images, archives, object files, and build logs are
