@@ -118,9 +118,9 @@ Cold-boot results:
 
 The `r2` device package is the hardware-tested functional package. Device
 package `r3` changes comments and package metadata only and has the same
-runtime configuration. Firmware `2-r1` passed checksum, package-build, and APK
-content validation; its `board-2.bin` payload is byte-identical to the
-hardware-tested revision.
+runtime configuration. Firmware `2-r1` passed checksum, package-build, APK
+content, installation, and cold-boot hardware validation. Its `board-2.bin`
+payload is byte-identical to the previous hardware-tested revision.
 
 ## Known limitations
 
