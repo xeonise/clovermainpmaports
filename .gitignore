@@ -134,6 +134,7 @@ ENV/
 *.tar
 *.tar.gz
 *.tar.xz
+*.bundle
 *.sha256
 *-build.log
 *-build.status
