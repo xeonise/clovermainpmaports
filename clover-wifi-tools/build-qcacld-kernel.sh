@@ -6,9 +6,9 @@ PKG_SRC="$ROOT_DIR/device/testing/linux-postmarketos-qcom-sdm660"
 PMB_BIN="${PMB_BIN:-$HOME/.local/bin/pmbootstrap}"
 PMB_ROOT_DIR="${PMB_ROOT_DIR:-$HOME/.local/var/pmbootstrap}"
 PKG_DST="$PMB_ROOT_DIR/cache_git/pmaports/device/testing/linux-postmarketos-qcom-sdm660"
-LOG_FILE="$ROOT_DIR/qcacld-r5-build.log"
-STATUS_FILE="$ROOT_DIR/qcacld-r5-build.status"
-ARTIFACT="$ROOT_DIR/linux-postmarketos-qcom-sdm660-6.19.10-r5.apk"
+LOG_FILE="$ROOT_DIR/qcacld-r6-build.log"
+STATUS_FILE="$ROOT_DIR/qcacld-r6-build.status"
+ARTIFACT="$ROOT_DIR/linux-postmarketos-qcom-sdm660-6.19.10-r6.apk"
 
 printf '%s\n' BUILD_RUNNING >"$STATUS_FILE"
 : >"$LOG_FILE"
@@ -53,10 +53,10 @@ done
 	linux-postmarketos-qcom-sdm660 || fail
 
 apk_path=$(find "$PMB_ROOT_DIR/packages" -type f \
-	-name 'linux-postmarketos-qcom-sdm660-6.19.10-r5.apk' \
+	-name 'linux-postmarketos-qcom-sdm660-6.19.10-r6.apk' \
 	-print | head -n 1)
 test -n "$apk_path" || {
-	echo "r5 APK was not found after a successful build"
+	echo "r6 APK was not found after a successful build"
 	fail
 }
 
@@ -71,8 +71,7 @@ tar -xOf "$ARTIFACT" \
 }
 
 for module_path in \
-	'lib/modules/6.19.10-sdm660/kernel/drivers/power/supply/qcom_smbx.ko.zst' \
-	'lib/modules/6.19.10-sdm660/kernel/drivers/usb/common/usb-conn-gpio.ko.zst'
+	'lib/modules/6.19.10-sdm660/kernel/drivers/power/supply/qcom_smbx.ko.zst'
 do
 	tar --warning=no-unknown-keyword -tf "$ARTIFACT" 2>/dev/null | \
 		grep -Fx "$module_path" >/dev/null || {
@@ -88,7 +87,8 @@ tar --warning=no-unknown-keyword -xOf "$ARTIFACT" "$dtb_path" >"$dtb_file" || {
 	echo "missing Clover DTB"
 	fail
 }
-for property in usb-role-switch role-switch-default-mode id-gpios usb-vbus-regulator
+for property in role-switch-default-mode qcom,usb-role-switch \
+	usb-vbus-regulator type-c-change
 do
 	strings "$dtb_file" | grep -Fx "$property" >/dev/null || {
 		rm -f "$dtb_file"
@@ -96,6 +96,11 @@ do
 		fail
 	}
 done
+if strings "$dtb_file" | grep -Fx id-gpios >/dev/null; then
+	rm -f "$dtb_file"
+	echo "Clover DTB still contains the incorrect GPIO ID workaround"
+	fail
+fi
 rm -f "$dtb_file"
 sha256sum "$ARTIFACT"
 printf '%s\n' BUILD_OK >"$STATUS_FILE"

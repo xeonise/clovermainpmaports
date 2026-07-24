@@ -3,7 +3,7 @@ maintainer="Alexey Minnekhanov <alexeymin@postmarketos.org>"
 _flavor="postmarketos-qcom-sdm660"
 pkgname=linux-$_flavor
 pkgver=6.19.10
-pkgrel=5
+pkgrel=6
 pkgdesc="Mainline kernel fork for Qualcomm SDM660 devices"
 arch="aarch64"
 _carch="arm64"
@@ -108,5 +108,5 @@ abf0ec97c2530ad3543a64019cefde3396c3361d7550513bf17948c6f4bf2621d88bb1947a519e8b
 d98c8aebb17b6eaf8ee9f69e0aa847989b64d88814d7df0709777f104cf25f72b57d189991c05e691ac9893a6ce353aa6500a5383a811886d0c21c184bd84131  xiaomi-wlan-728ac0be7512264ecdc3bf885a19c581c6890c17.tar.gz
 0cdb48397e003388fa0a52b8293818992303203f956662c88fbdbb2c4d290362d248b0f9473e9bf5e6cce87460eca9bd58047903dac6bcaa9c5c19fd822f2c25  0001-clover-icnss-platform-integration.patch
 3e580ead51e871a9d915285f0726f8079cdd45683d2052f80a52b4e8fb81ed4afc43babc76344bfaeb5dee432895769118607a6039d00ff793d47b38bce4d0b5  0002-xiaomi-qcacld-linux-6.19-port.patch
-4a6cbe115a44bbfc3631bd9ae7f202475193913ef4a9fd2cdfe8cadeab5996ce8f89ea7896780936a397bade9e9b99a0ffe982695b30cc94acf78f01a3acbc57  0003-clover-usb-otg.patch
+34103bd1de0a1ca84d73279b6a9e9a253b150106980a19f149d1165538a98c79b0c53c15ecb50d24b923cee54651f3e9c7faf82f1c6c5ff827173d296fe6b9f0  0003-clover-usb-otg.patch
 "

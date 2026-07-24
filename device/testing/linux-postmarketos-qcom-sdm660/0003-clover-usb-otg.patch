@@ -1,14 +1,27 @@
 diff --git a/Documentation/devicetree/bindings/power/supply/qcom,pmi8998-charger.yaml b/Documentation/devicetree/bindings/power/supply/qcom,pmi8998-charger.yaml
-index 70f5cd6..0f9cde3 100644
+index 70f5cd6..10db2b0 100644
 --- a/Documentation/devicetree/bindings/power/supply/qcom,pmi8998-charger.yaml
 +++ b/Documentation/devicetree/bindings/power/supply/qcom,pmi8998-charger.yaml
-@@ -42,0 +43,5 @@ properties:
+@@ -22 +22,2 @@ properties:
+-    maxItems: 4
++    minItems: 4
++    maxItems: 5
+@@ -24,0 +26 @@ properties:
++    minItems: 4
+@@ -29,0 +32 @@ properties:
++      - const: type-c-change
+@@ -42,0 +46,10 @@ properties:
++  qcom,usb-role-switch:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      USB controller role switch driven by the PM660 Type-C state machine.
++
 +  usb-vbus-regulator:
 +    type: object
 +    $ref: /schemas/regulator/regulator.yaml#
 +    unevaluatedProperties: false
 +
-@@ -80,0 +86,8 @@ examples:
+@@ -80,0 +94,8 @@ examples:
 +
 +        usb-vbus-regulator {
 +          regulator-name = "usb_otg_vbus";
@@ -18,12 +31,21 @@ index 70f5cd6..0f9cde3 100644
 +          regulator-max-microamp = <1500000>;
 +        };
 diff --git a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
-index 43bef77..b73fbe6 100644
+index 43bef77..a048673 100644
 --- a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
-@@ -230 +229,0 @@ &pm660_charger {
+@@ -228,0 +229,7 @@ &pm660_charger {
++	interrupts = <0x0 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
++		     <0x0 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
++		     <0x0 0x16 0x1 IRQ_TYPE_EDGE_RISING>,
++		     <0x0 0x13 0x6 IRQ_TYPE_EDGE_RISING>,
++		     <0x0 0x13 0x7 IRQ_TYPE_EDGE_RISING>;
++	interrupt-names = "usb-plugin", "bat-ov", "wdog-bark",
++			  "usbin-icl-change", "type-c-change";
+@@ -230 +237 @@ &pm660_charger {
 -
-@@ -231,0 +231,8 @@ &pm660_charger {
++	qcom,usb-role-switch = <&usb3_dwc3>;
+@@ -231,0 +239,8 @@ &pm660_charger {
 +
 +	pm660_usb_otg_vbus: usb-vbus-regulator {
 +		regulator-name = "usb_otg_vbus";
@@ -32,31 +54,25 @@ index 43bef77..b73fbe6 100644
 +		regulator-min-microamp = <250000>;
 +		regulator-max-microamp = <1500000>;
 +	};
-@@ -745,2 +752,3 @@ &usb3_dwc3 {
+@@ -745,2 +760,3 @@ &usb3_dwc3 {
 -	dr_mode = "peripheral";
 -
 +	dr_mode = "otg";
 +	usb-role-switch;
 +	role-switch-default-mode = "peripheral";
-@@ -747,0 +756,9 @@ &usb3_dwc3 {
-+
-+	/* GPIO 58 carries the USB ID state on SDM660 mobile designs. */
-+	connector {
-+		compatible = "gpio-usb-b-connector", "usb-b-connector";
-+		label = "USB-C";
-+		type = "micro";
-+		id-gpios = <&tlmm 58 GPIO_ACTIVE_HIGH>;
-+		vbus-supply = <&pm660_usb_otg_vbus>;
-+	};
 diff --git a/drivers/power/supply/qcom_smbx.c b/drivers/power/supply/qcom_smbx.c
-index 78de881..f13d5b8 100644
+index 78de881..ed3c0f0 100644
 --- a/drivers/power/supply/qcom_smbx.c
 +++ b/drivers/power/supply/qcom_smbx.c
 @@ -12,0 +13 @@
 +#include <linux/iopoll.h>
-@@ -22,0 +24 @@
+@@ -21,0 +23 @@
++#include <linux/property.h>
+@@ -22,0 +25 @@
 +#include <linux/regulator/driver.h>
-@@ -103,0 +106,12 @@
+@@ -23,0 +27 @@
++#include <linux/usb/role.h>
+@@ -103,0 +108,12 @@
 +#define OTG_STATUS					0x109
 +#define BOOST_SOFTSTART_DONE_BIT			BIT(3)
 +
@@ -69,13 +85,17 @@ index 78de881..f13d5b8 100644
 +#define OTG_CURRENT_MAX_UA				2000000
 +#define OTG_DEFAULT_CURRENT_UA				1500000
 +
-@@ -386,0 +401,2 @@ struct smb_init_register {
+@@ -386,0 +403,4 @@ struct smb_init_register {
 + * @vbus_rdev:		PM660 OTG boost regulator
 + * @usb_input_suspended: USB input state saved while sourcing VBUS
-@@ -402,0 +419,2 @@ struct smb_chip {
++ * @role_sw:		USB controller role switch controlled by PM660 Type-C state
++ * @usb_role:		Last role applied to the USB controller
+@@ -402,0 +423,4 @@ struct smb_chip {
 +	struct regulator_dev *vbus_rdev;
 +	bool usb_input_suspended;
-@@ -788,0 +807,196 @@ static const struct power_supply_desc smb_psy_desc = {
++	struct usb_role_switch *role_sw;
++	enum usb_role usb_role;
+@@ -788,0 +813,322 @@ static const struct power_supply_desc smb_psy_desc = {
 +/* The PM660 OTG current selector advances in 250 mA steps. */
 +static int smb_set_otg_current_limit(struct smb_chip *chip,
 +				     int min_uA, int max_uA)
@@ -272,8 +292,153 @@ index 78de881..f13d5b8 100644
 +	return 0;
 +}
 +
-@@ -964,0 +1179,4 @@ static int smb_probe(struct platform_device *pdev)
++/* PM660 exposes the negotiated Type-C data role in TYPE_C_STATUS_4. */
++static int smb_get_typec_role(struct smb_chip *chip, enum usb_role *role)
++{
++	unsigned int status;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_4, &status);
++	if (rc < 0)
++		return rc;
++
++	if (!(status & CC_ATTACHED_BIT))
++		*role = USB_ROLE_NONE;
++	else if (status & UFP_DFP_MODE_STATUS_BIT)
++		*role = USB_ROLE_HOST;
++	else
++		*role = USB_ROLE_DEVICE;
++
++	return 0;
++}
++
++static int smb_set_typec_role(struct smb_chip *chip, enum usb_role role)
++{
++	int rc;
++
++	if (role == chip->usb_role)
++		return 0;
++
++	/* Stop the host before removing VBUS or changing to device mode. */
++	if (chip->usb_role == USB_ROLE_HOST) {
++		rc = usb_role_switch_set_role(chip->role_sw, USB_ROLE_NONE);
++		if (rc < 0)
++			return rc;
++
++		rc = smb_vbus_regulator_disable(chip->vbus_rdev);
++		if (rc < 0)
++			return rc;
++	}
++
++	if (role == USB_ROLE_HOST) {
++		rc = usb_role_switch_set_role(chip->role_sw, USB_ROLE_NONE);
++		if (rc < 0)
++			return rc;
++
++		/* A Type-C sink has been negotiated, so it is safe to source VBUS. */
++		rc = smb_vbus_regulator_enable(chip->vbus_rdev);
++		if (rc < 0)
++			return rc;
++
++		rc = usb_role_switch_set_role(chip->role_sw, USB_ROLE_HOST);
++		if (rc < 0) {
++			smb_vbus_regulator_disable(chip->vbus_rdev);
++			return rc;
++		}
++	} else {
++		rc = usb_role_switch_set_role(chip->role_sw, role);
++		if (rc < 0)
++			return rc;
++	}
++
++	chip->usb_role = role;
++	dev_info(chip->dev, "USB Type-C role changed to %s\n",
++		 usb_role_string(role));
++
++	return 0;
++}
++
++static int smb_update_typec_role(struct smb_chip *chip)
++{
++	enum usb_role role;
++	int rc;
++
++	rc = smb_get_typec_role(chip, &role);
++	if (rc < 0)
++		return rc;
++
++	return smb_set_typec_role(chip, role);
++}
++
++static irqreturn_t smb_handle_typec_change(int irq, void *data)
++{
++	struct smb_chip *chip = data;
++	int rc;
++
++	rc = smb_update_typec_role(chip);
++	if (rc < 0)
++		dev_err(chip->dev, "failed to update USB Type-C role: %d\n", rc);
++
++	return IRQ_HANDLED;
++}
++
++static void smb_typec_cleanup(void *data)
++{
++	struct smb_chip *chip = data;
++
++	usb_role_switch_set_role(chip->role_sw, USB_ROLE_NONE);
++	if (chip->usb_role == USB_ROLE_HOST)
++		smb_vbus_regulator_disable(chip->vbus_rdev);
++	usb_role_switch_put(chip->role_sw);
++}
++
++static int smb_init_typec(struct smb_chip *chip)
++{
++	struct fwnode_handle *role_fwnode;
++	int rc;
++
++	role_fwnode = fwnode_find_reference(dev_fwnode(chip->dev),
++					    "qcom,usb-role-switch", 0);
++	if (IS_ERR(role_fwnode)) {
++		if (PTR_ERR(role_fwnode) == -ENOENT)
++			return 0;
++		return PTR_ERR(role_fwnode);
++	}
++
++	chip->role_sw = usb_role_switch_find_by_fwnode(role_fwnode);
++	fwnode_handle_put(role_fwnode);
++	if (!chip->role_sw)
++		return -EPROBE_DEFER;
++
++	chip->usb_role = usb_role_switch_get_role(chip->role_sw);
++	rc = devm_add_action_or_reset(chip->dev, smb_typec_cleanup, chip);
++	if (rc < 0)
++		return rc;
++
++	return 0;
++}
++
+@@ -964,0 +1311,9 @@ static int smb_probe(struct platform_device *pdev)
 +	rc = smb_init_vbus_regulator(chip);
 +	if (rc < 0)
 +		return rc;
 +
++	rc = smb_init_typec(chip);
++	if (rc < 0)
++		return dev_err_probe(chip->dev, rc,
++				     "failed to initialize USB Type-C role control\n");
++
+@@ -1015,0 +1371,6 @@ static int smb_probe(struct platform_device *pdev)
++	if (chip->role_sw) {
++		rc = smb_init_irq(chip, &irq, "type-c-change",
++				  smb_handle_typec_change);
++		if (rc < 0)
++			return rc;
++	}
+@@ -1043,0 +1405,6 @@ static int smb_probe(struct platform_device *pdev)
++	if (chip->role_sw) {
++		rc = smb_update_typec_role(chip);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "failed to set initial USB Type-C role\n");
++	}

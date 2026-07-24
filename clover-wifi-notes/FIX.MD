@@ -84,21 +84,28 @@ signal becomes weak.
 
 ## Local-only USB OTG work
 
-Kernel `6.19.10-r5` adds `0003-clover-usb-otg.patch`. It is separate from the
-two QCACLD/ICNSS patches and has not been installed on the tablet.
+Kernel `6.19.10-r5` was the first installed OTG test. Its VBUS boost path
+worked, and a `13fe:4300 USB DISK 2.0` device enumerated briefly, but its role
+detection was wrong. GPIO 58 is a Type-C/CC signal on Clover, not a micro-USB
+ID signal: an empty port entered host mode with VBUS enabled, while inserting
+the OTG adapter switched back to device mode. Repeated role changes ended in a
+hard reset. There was no pstore panic record and the previous journal ended
+without a normal shutdown, consistent with a power reset rather than a kernel
+oops.
 
-- Clover's DWC3 controller changes from fixed peripheral mode to dual-role
-  mode, with peripheral as the default role.
-- GPIO 58 supplies the USB ID state to the generic connector role-switch
-  driver, following the existing SDM660 mobile-device workaround.
-- PM660 now exposes its 5 V OTG boost path as a regulator. The driver suspends
-  USB input while sourcing VBUS and ramps current from 250 mA to 1.5 A during
-  the PM660 soft-start sequence.
+Kernel `6.19.10-r6` removes that GPIO workaround and uses PM660's Type-C state
+machine instead. The `type-c-change` IRQ reads `TYPE_C_STATUS_4`: no CC attach
+selects no role, attached DFP selects host, and attached UFP selects device.
+The PM660 driver enables its 5 V boost only after a Type-C sink has been
+negotiated, then starts DWC3 host mode. On removal it stops the host before
+disabling VBUS. Current is ramped from 250 mA to 1.5 A during soft start.
 
-The complete r5 package build and DTB inspection passed locally. Hardware
-validation is still required: test peripheral USB first, then an externally
-powered hub, a low-power OTG device, role removal, and over-current handling.
-Do not install this experimental kernel until that test session is planned.
+The complete r6 build, module dependency check, and decompiled DTB inspection
+passed. The APK was uploaded to the tablet but is not installed. The tablet is
+still running r5; as a temporary current-boot safety measure `usb_conn_gpio`
+was unloaded, DWC3 was returned to device mode, and VBUS was verified disabled.
+That mitigation does not survive a reboot, so do not reboot r5 before either
+installing r6 or rolling back to r4.
 
 ## Hardware validation
 
@@ -130,7 +137,8 @@ Cold-boot results:
 | Package | SHA-256 |
 | --- | --- |
 | `linux-postmarketos-qcom-sdm660-6.19.10-r4.apk` | `4744524782b553287159d72d1eec76d1c0c48b434dfd2d7edb2f7381f88729ac` |
-| `linux-postmarketos-qcom-sdm660-6.19.10-r5.apk` (local-only OTG build) | `e2f285516b16403a881e7712a86ecdd0a5cee4dd2eec8afd23ec89d28f3a6ad0` |
+| `linux-postmarketos-qcom-sdm660-6.19.10-r5.apk` (unsafe GPIO OTG test) | `e2f285516b16403a881e7712a86ecdd0a5cee4dd2eec8afd23ec89d28f3a6ad0` |
+| `linux-postmarketos-qcom-sdm660-6.19.10-r6.apk` (PM660 Type-C OTG test, uploaded but uninstalled) | `2e186732e4296b658c6254be0c1aa4fe0595cc8c1b0ce293fbd1cca290d04738` |
 | `device-xiaomi-clover-11-r2.apk` | `79ce57cb3e468cf17d194d134150f5a640023a164ede6e8e547e5d657e10fed6` |
 | `device-xiaomi-clover-11-r3.apk` | `e7cf0a25871c05250743894c7e1b9b64f15bfdc5eb7351fb406f8e6581301564` |
 | `firmware-xiaomi-clover-2-r1.apk` | `a53211d94d055e51528697002f8fa9d8e9231c49e5ec96640a98ae6c65d05745` |
