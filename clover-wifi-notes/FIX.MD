@@ -82,6 +82,24 @@ between 5 GHz access points remains available. The trade-off is that the
 driver will not automatically fall back from 5 GHz to 2.4 GHz when the 5 GHz
 signal becomes weak.
 
+## Local-only USB OTG work
+
+Kernel `6.19.10-r5` adds `0003-clover-usb-otg.patch`. It is separate from the
+two QCACLD/ICNSS patches and has not been installed on the tablet.
+
+- Clover's DWC3 controller changes from fixed peripheral mode to dual-role
+  mode, with peripheral as the default role.
+- GPIO 58 supplies the USB ID state to the generic connector role-switch
+  driver, following the existing SDM660 mobile-device workaround.
+- PM660 now exposes its 5 V OTG boost path as a regulator. The driver suspends
+  USB input while sourcing VBUS and ramps current from 250 mA to 1.5 A during
+  the PM660 soft-start sequence.
+
+The complete r5 package build and DTB inspection passed locally. Hardware
+validation is still required: test peripheral USB first, then an externally
+powered hub, a low-power OTG device, role removal, and over-current handling.
+Do not install this experimental kernel until that test session is planned.
+
 ## Hardware validation
 
 Final validation was performed on a Xiaomi Mi Pad 4 running:
@@ -112,6 +130,7 @@ Cold-boot results:
 | Package | SHA-256 |
 | --- | --- |
 | `linux-postmarketos-qcom-sdm660-6.19.10-r4.apk` | `4744524782b553287159d72d1eec76d1c0c48b434dfd2d7edb2f7381f88729ac` |
+| `linux-postmarketos-qcom-sdm660-6.19.10-r5.apk` (local-only OTG build) | `e2f285516b16403a881e7712a86ecdd0a5cee4dd2eec8afd23ec89d28f3a6ad0` |
 | `device-xiaomi-clover-11-r2.apk` | `79ce57cb3e468cf17d194d134150f5a640023a164ede6e8e547e5d657e10fed6` |
 | `device-xiaomi-clover-11-r3.apk` | `e7cf0a25871c05250743894c7e1b9b64f15bfdc5eb7351fb406f8e6581301564` |
 | `firmware-xiaomi-clover-2-r1.apk` | `a53211d94d055e51528697002f8fa9d8e9231c49e5ec96640a98ae6c65d05745` |

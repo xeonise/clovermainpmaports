@@ -3,7 +3,7 @@ maintainer="Alexey Minnekhanov <alexeymin@postmarketos.org>"
 _flavor="postmarketos-qcom-sdm660"
 pkgname=linux-$_flavor
 pkgver=6.19.10
-pkgrel=4
+pkgrel=5
 pkgdesc="Mainline kernel fork for Qualcomm SDM660 devices"
 arch="aarch64"
 _carch="arm64"
@@ -36,6 +36,7 @@ source="
 	xiaomi-wlan-$_xiaomi_wlan_commit.tar.gz::https://github.com/MiCode/vendor_qcom_opensource_wlan/archive/$_xiaomi_wlan_commit.tar.gz
 	0001-clover-icnss-platform-integration.patch
 	0002-xiaomi-qcacld-linux-6.19-port.patch
+	0003-clover-usb-otg.patch
 "
 # The archive directory omits the leading v from the tag.
 builddir="$srcdir/linux-$pkgver-sdm660"
@@ -107,4 +108,5 @@ abf0ec97c2530ad3543a64019cefde3396c3361d7550513bf17948c6f4bf2621d88bb1947a519e8b
 d98c8aebb17b6eaf8ee9f69e0aa847989b64d88814d7df0709777f104cf25f72b57d189991c05e691ac9893a6ce353aa6500a5383a811886d0c21c184bd84131  xiaomi-wlan-728ac0be7512264ecdc3bf885a19c581c6890c17.tar.gz
 0cdb48397e003388fa0a52b8293818992303203f956662c88fbdbb2c4d290362d248b0f9473e9bf5e6cce87460eca9bd58047903dac6bcaa9c5c19fd822f2c25  0001-clover-icnss-platform-integration.patch
 3e580ead51e871a9d915285f0726f8079cdd45683d2052f80a52b4e8fb81ed4afc43babc76344bfaeb5dee432895769118607a6039d00ff793d47b38bce4d0b5  0002-xiaomi-qcacld-linux-6.19-port.patch
+3605c1a853294ccfeeecae59ec75f495e643db66df61903b8d4577615d141270a5700980d3c8f427608882cc063a75a874a70b748d778b3fe11eae8bb5e805b0  0003-clover-usb-otg.patch
 "
