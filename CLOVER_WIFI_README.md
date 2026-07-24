@@ -1,8 +1,10 @@
-# Xiaomi Clover QCACLD Wi-Fi port
+# Xiaomi Clover postmarketOS Wi-Fi and USB OTG fixes
 
-This repository carries the postmarketOS package changes used to run Xiaomi's
-QCACLD 5.2 driver with WCN3990 on Xiaomi Mi Pad 4 (`clover`) and Linux 6.19.
-It is based on the upstream postmarketOS pmaports tree.
+This repository carries the hardware-tested postmarketOS fixes for Wi-Fi and
+USB OTG on Xiaomi Mi Pad 4 (`clover`) with Linux 6.19. Wi-Fi uses Xiaomi's
+QCACLD 5.2 driver with WCN3990, while OTG uses PM660 Type-C role detection and
+VBUS control. The repository is based on the upstream postmarketOS pmaports
+tree.
 
 The main source changes are in:
 
@@ -23,3 +25,6 @@ The hardware-tested state automatically joins the configured 5 GHz network,
 supports scanning and Internet traffic, and accepts SSH immediately after a
 cold boot. Clover's firmware-assisted roaming is restricted to the currently
 connected band so a fixed 5 GHz profile does not move to 2.4 GHz after a scan.
+USB OTG automatically switches between charging/device, disconnected, and
+host roles. VBUS shuts down after adapter removal; a USB flash drive and a
+wireless mouse/keyboard receiver were validated successfully.

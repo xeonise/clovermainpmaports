@@ -1,12 +1,12 @@
-# Xiaomi Mi Pad 4 (clover) QCACLD Wi-Fi fix
+# Xiaomi Mi Pad 4 (clover) Wi-Fi and USB OTG fixes
 
-This document describes only the final QCACLD/ICNSS implementation used for
-Wi-Fi on Xiaomi Mi Pad 4. It intentionally omits the obsolete development and
-driver-experiment history.
+This document describes the final hardware-tested QCACLD/ICNSS Wi-Fi and
+PM660 Type-C USB OTG implementations for Xiaomi Mi Pad 4. It intentionally
+omits obsolete development and driver-experiment history.
 
 ## Current implementation
 
-- Kernel package: `linux-postmarketos-qcom-sdm660` `6.19.10-r4`.
+- Kernel package: `linux-postmarketos-qcom-sdm660` `6.19.10-r6`.
 - Xiaomi WLAN source commit:
   `728ac0be7512264ecdc3bf885a19c581c6890c17`.
 - Firmware package: `firmware-xiaomi-clover` `2-r1`, based on the current
@@ -16,6 +16,8 @@ driver-experiment history.
 - QCACLD is the default Wi-Fi driver for Clover.
 - The tested installation does not load the ath10k driver.
 - `wlan.ko.zst` depends on `qcom-icnss-clover.ko.zst`.
+- USB OTG uses the PM660 Type-C state machine, DWC3 role switching, and the
+  PM660 5 V VBUS boost regulator.
 
 The kernel package carries exactly two Wi-Fi patches:
 
@@ -82,7 +84,7 @@ between 5 GHz access points remains available. The trade-off is that the
 driver will not automatically fall back from 5 GHz to 2.4 GHz when the 5 GHz
 signal becomes weak.
 
-## Local-only USB OTG work
+## USB OTG fix
 
 Kernel `6.19.10-r5` was the first installed OTG test. Its VBUS boost path
 worked, and a `13fe:4300 USB DISK 2.0` device enumerated briefly, but its role
