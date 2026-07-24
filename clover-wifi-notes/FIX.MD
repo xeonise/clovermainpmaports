@@ -109,6 +109,8 @@ validation passed the complete role cycle:
 - an empty OTG adapter produced `TYPE_C_STATUS_4 = 0x91`, selected host mode,
   enabled VBUS, and started both xHCI buses;
 - a `13fe:4300 Wilk USB DISK 2.0` enumerated as `/dev/sda` with both partitions;
+- a wireless USB receiver enumerated successfully and both its mouse and
+  keyboard worked;
 - removing the flash drive and adapter stopped xHCI and disabled VBUS;
 - no hard reset, kernel oops, call trace, Type-C error, or OTG soft-start error
   occurred.
