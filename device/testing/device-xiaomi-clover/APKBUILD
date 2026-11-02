@@ -3,7 +3,7 @@ maintainer=""
 pkgname=device-xiaomi-clover
 pkgdesc="Xiaomi Mi Pad 4"
 pkgver=11
-pkgrel=3
+pkgrel=4
 url="https://postmarketos.org"
 license="MIT"
 arch="aarch64"
@@ -24,6 +24,8 @@ subpackages="
 "
 source="
 	80-xiaomi-clover-wlan-mac.rules
+	90-xiaomi-clover-crash.conf
+	90-xiaomi-clover-journal.conf
 	90-xiaomi-clover-wifi.conf
 	90-xiaomi-clover-qcacld.conf
 	90-xiaomi-clover-qcacld.modules
@@ -55,6 +57,10 @@ package() {
 
 	install -Dm644 "$srcdir"/90-xiaomi-clover-wifi.conf \
 		-t "$pkgdir"/usr/lib/NetworkManager/conf.d/
+	install -Dm644 "$srcdir"/90-xiaomi-clover-crash.conf \
+		-t "$pkgdir"/usr/lib/sysctl.d/
+	install -Dm644 "$srcdir"/90-xiaomi-clover-journal.conf \
+		-t "$pkgdir"/usr/lib/systemd/journald.conf.d/
 
 	# QCACLD owns Clover's WCN3990 on every normal boot.  It must be selected
 	# before module autoload, as ath10k_snoc and QCACLD cannot bind together.
@@ -94,15 +100,17 @@ kernel_cloverplus() {
 
 sha512sums="
 a798d825f05e07c0520549bac0a8653054b261e35964cb1e4b5436d05249d5ba590f904ae4dbb9edc87871bb8d2cefbcd9a1e905897f8e9ef8fe043e1439ba91  80-xiaomi-clover-wlan-mac.rules
+6b62af187580cb58d479f49f19395aaa6a6948ff0c2ffc5283f312d4922e4a77b2988765881f3c80a10667fc5a0bac1eef955450e6286bb099e59fb59a2e3d68  90-xiaomi-clover-crash.conf
+33adca22a20be5466fd7cd3fa2f75e3ff88363898cf1e0899a7a8d8f48dd18312b2f55ef6d1837cb5dfbb003175534a166b4a7b4ffcc5bd0b3ad2a39bae6b5d6  90-xiaomi-clover-journal.conf
 efc57ccf15057ca4f91b73a7eb56f489a5e92bdb0cfad75d6e60bdc3a2da57969a797ca85f3c2bb4fc7d0185d2081ba84a08f0d4b08f578295efc4082fa88222  90-xiaomi-clover-wifi.conf
 09f58d7fa7955ae47eb5232d76a436cf17a9da94ea773c3c85341bdc1bb63bb935f76bfa62454b8f6ef6550af5aa8d83980b603986d22a8992e2127cdeab05b5  90-xiaomi-clover-qcacld.conf
 5ccf339a2157f6316b1af85668048e8a64e99619cfd1bd49aa71490c05697ccb8fc8499d75759889f5ece3ae2d283b133ff4ebfc90de63fce8a34c0b0a5f3edf  90-xiaomi-clover-qcacld.modules
-9643fa77b86e9604aba8680ba9df9980287eafa9fd79876893cc468f4a5ebf53a91d94d3b7aa2d360d136ee52c9cffc0aa7ea4a3976cebcada8d05aaecb06bec  WCNSS_qcom_cfg.ini
-6f680419fc1d841ccbaf8f02e6abe6203f6e81b86b524e3c288da9c33d9cfb7cbdb8ebfbe87ee25ef1c438e5696ac18e96b705c3e0c4e83cad734e9ba9eeecf3  clover-wifi-driver
-9e9d34d07ee3c403c8a8f4f521c8ca7add30dd969c1706f11f3a3aa9c69af4be4d0ba758cb37786606bec4e5f0d464100de6086927dd28679d610f83c8005021  deviceinfo
-77b78f53ff44c7917ff8dd06fd2e1d8038ae42063a232709546789a63e0e3d01d99940be8608b5afc3450f4206d42ec2491601267d5ce947c030666641a5b84b  modules-initfs.clover
-c43a8042826d3f32a9a73fd599914bec0c20af9b1f69faef7d778508d0d47ea89ce787294a9a42e89a4d29a9f47f23825fea9fc8ae06d4d9e34405237db114fa  modules-initfs.cloverplus
-4308178dd22bad0db0c64db65b137c78bf87f0e358fba759830127949c16af7a252dd8ba6e57604784c942e2d073d0c1a1e411133f307d4e13b5ffe1e3fd97cc  wifi-macaddr.sh
+b283efbb0a77d07be6434253529447c396e75dc7d09b45a39fc49f10b0f6be4d05c820ca706a469ce089ee35a89c3284f549036ed2a9ed902acc161650a33cc2  WCNSS_qcom_cfg.ini
+bc874d8b83fecaac9b373d9d7da00e5ac3bbad1232792b6f5cd6007f05b22f9198b8cfbacbd8fb15c5cf460ccbbfc153ddb45044f466154a02f62e3a1327256b  clover-wifi-driver
+207052d7a7562ea08b215dd0148f656a3d5b9272dfce1ada2d467fc95684eeeee6ea046392a5321ce69d64522d5074ee0c4aaf1aebdef2d332075c3dd508194d  deviceinfo
+b6dbe06e0cd692ecc95d4cccd908ae675f5fe91dbe137508c85f0e24b2c5fa109b58c55a9e27b82eec2221891a139eae8f29887e8b5d77953543e155e8182f23  modules-initfs.clover
+2239eced1a2ece9c9a4094c5b8a0c1ab410356eeeb0083b6be3f32e9d375784402350d648f56c27503eb19ba4f2598ea215e1903b07a0a963b22870056fbec34  modules-initfs.cloverplus
+7c177b165752d10d4d8897c3d398bec0ab8d17cb35cbc92a61ce838cd5b58bb9d3e0ed139e45ca1153802c7950ae5d500d3e103ba1a863224f8a4a164ec122d7  wifi-macaddr.sh
 a6a14430bf199fb74f7376f246362f3a8de267e5f7592e51875f89cb046f9f935762cbb373f7608629f0fbfbe1f82edebaa23c8b30629455a05cc64db0861831  xiaomi-clover-wlan-mac.service
-62e9619236c6db5cf4b56774188a8bdd9bf8a1bd928b2e70c770a67acf0e8a9d6a942f31676c25cde96ff8434c11df9c7ef6dfceea3309a847568d239515bb3e  xiaomi-clover-wlan-reset
+95f09cde026b8c69520788c1ef07a2ae81aa92f7ce7a9589a8d0dcf9f2cc13c8d0a6687b73f0c07cb829504509994f1ba4b7f03e4cdec5b75cdc13766f7be6fd  xiaomi-clover-wlan-reset
 "

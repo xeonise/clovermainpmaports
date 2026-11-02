@@ -1,12 +1,14 @@
 # Xiaomi Mi Pad 4 (clover) Wi-Fi and USB OTG fixes
 
-This document describes the final hardware-tested QCACLD/ICNSS Wi-Fi and
-PM660 Type-C USB OTG implementations for Xiaomi Mi Pad 4. It intentionally
-omits obsolete development and driver-experiment history.
+This document describes QCACLD/ICNSS Wi-Fi and PM660 Type-C USB OTG on
+Xiaomi Mi Pad 4. The r6 baseline below was hardware-tested. The r7 freeze
+hardening is a new revision and needs a fresh cold-boot and endurance test;
+earlier hardware results do not validate the new revision.
 
 ## Current implementation
 
-- Kernel package: `linux-postmarketos-qcom-sdm660` `6.19.10-r6`.
+- Kernel package: `linux-postmarketos-qcom-sdm660` `6.19.10-r7`.
+- Device package: `device-xiaomi-clover` `11-r4`.
 - Xiaomi WLAN source commit:
   `728ac0be7512264ecdc3bf885a19c581c6890c17`.
 - Firmware package: `firmware-xiaomi-clover` `2-r1`, based on the current
@@ -19,7 +21,7 @@ omits obsolete development and driver-experiment history.
 - USB OTG uses the PM660 Type-C state machine, DWC3 role switching, and the
   PM660 5 V VBUS boost regulator.
 
-The kernel package carries exactly two Wi-Fi patches:
+The kernel package carries these Wi-Fi patches (0003 is the existing OTG fix):
 
 1. `0001-clover-icnss-platform-integration.patch`
    - adds the Clover device-tree integration;
@@ -29,7 +31,108 @@ The kernel package carries exactly two Wi-Fi patches:
 2. `0002-xiaomi-qcacld-linux-6.19-port.patch`
    - ports Xiaomi QCACLD/QDF to Linux 6.19;
    - adapts timers, refcounts, cfg80211, netdev, crypto, SMMU, and DMA APIs;
-   - includes the runtime fixes required on Clover.
+    - includes the runtime fixes required on Clover.
+3. `0004-clover-icnss-irq-safe-lookup-and-lifecycle.patch`
+   - removes sleeping lookups from CE hard IRQs and noirq PM callbacks;
+   - serializes client callbacks, unregister, firmware work and modem SSR;
+   - fixes power voting, teardown order, duplicate service discovery and
+     unsafe MSA fallback/ownership assumptions;
+   - removes the unit-specific MAC from the shared device tree.
+4. `0005-qcacld-dump-station-report-bssid.patch`
+   - returns the associated AP's BSSID, rather than the tablet's own MAC.
+5. `0006-qcacld-production-assertions-and-build-checks.patch`
+   - decouples vendor BUG assertions from CONFIG_SLUB_DEBUG;
+   - checks register availability before CE interrupt/tasklet MMIO;
+   - keeps incompatible pointer types fatal and fixes current-clang builds.
+
+## r7 freeze investigation and hardening
+
+The last recorded boot stopped logging at 2026-11-02 11:39:14 EET after
+about 18 hours. No panic or firmware crash was preserved. That does **not**
+prove a particular cause: journald may lose buffered entries, CPU0 also
+handles storage, and a long power-button reset need not retain ramoops RAM.
+An earlier boot captured a CPU5 hard lockup after a GPU debugfs read, but
+that is not evidence that the most recent freeze had the same cause.
+
+The ICNSS lookup bug is concrete: the CE hard IRQ handler calls
+`pld_get_ce_id()` -> `icnss_get_ce_id()` -> `icnss_from_dev()`, which used
+to take `icnss_global_lock`, a mutex. The new lookup uses acquire/release
+publication without sleeping. The module dependency pins the backend while
+qcacld is loaded; manual sysfs unbind is suppressed, and client removal and
+`free_irq()` finish before the backend pointer is cleared. This is a strong
+freeze candidate, not a demonstrated explanation of the last incident.
+
+Firmware callbacks run on the ordered workqueue and are serialized against
+client unregister. Modem BEFORE_SHUTDOWN now reports FW_DOWN before WLFW's
+late QMI deletion callback. CE dispatch tests target availability before the
+MMIO write that disables a CE interrupt; a queued tasklet also checks it
+before servicing the engine. These reduce the shutdown-access window; SSR,
+suspend/resume and firmware recovery still need hardware stress testing.
+Power-on is voted before WLFW setup, and failure paths keep power and MSA
+ownership intact while a client is probed. Missing reserved MSA memory now
+fails probe rather than passing a DMA-IOMMU IOVA to SCM as a physical address.
+SCM `-EINVAL` is no longer assumed to mean successful ownership transfer.
+
+The device package also:
+
+- sets explicit FATAL/ERROR/WARN trace masks (`14`) and disables unsolicited
+  firmware diagnostic multicast when no cnss_diag listener is present;
+- fixes `cfd_trace_enable_txrx` to `qdf_trace_enable_txrx` and removes duplicate
+  legacy INI keys, preserving the **first** entry, which `find_cfg_item()` uses;
+  `65535` is an unset sentinel, not an explicit all-level override;
+- removes `ignore_loglevel` without removing kernel messages from pstore;
+- preserves administrative IFF_UP during factory MAC setup, even without carrier;
+- leaves the old NetworkManager reset dispatcher as a no-op so upgrades replace
+  the unsafe forced-down/up handler, including on intentional rfkill/suspend;
+- refuses driver handoff when the previous modules cannot be unloaded;
+- sets panic-on-oops and panic-on-soft/hard-lockup, with a 120-second reboot
+  delay, and reduces journald's sync interval to 5 seconds. This cannot recover
+  a SoC-wide bus stall that prevents the watchdog detectors from running.
+
+### Hardware watchdog and deployment
+
+The running tablet has ramoops at `0x9fe00000`, but no `/dev/watchdog*` or
+watchdog platform device. `CONFIG_QCOM_WDT=m` alone is not sufficient.
+This revision does **not** invent a watchdog DT register address or enable
+systemd's hardware watchdog on unverified hardware. A hardware watchdog node
+and reset/pretimeout behaviour must be validated separately. Only after that
+should an administrator enable `RuntimeWatchdogSec=30s` in a local systemd
+manager drop-in. Without that validation, a total freeze can still need a
+manual reset.
+
+Rebuild the kernel and device package, install them together and cold-boot
+with local/USB recovery access. Do not replace these modules over the sole
+Wi-Fi SSH connection, and do not read powered-down GPU debugfs register dumps.
+Check the following after boot:
+
+```sh
+uname -a
+sudo clover-wifi-driver qcacld-milestones
+iw dev wlan0 link
+iw dev wlan0 station dump
+sysctl kernel.panic kernel.panic_on_oops kernel.softlockup_panic kernel.hardlockup_panic
+sudo journalctl -b -k
+sudo ls -l /sys/fs/pstore /var/lib/systemd/pstore
+```
+
+In STA mode, `station dump` must name the connected AP, not wlan0's own MAC.
+Validate cold boot, immediate SSH, scanning, reconnect, rfkill, suspend/resume,
+and at least a 24-48 hour idle-while-charging run. Save the previous boot's
+journal and archived pstore on the first reboot after any failure. The original
+skcipher allocation-failure handling and idle-shutdown design are not claimed
+as root causes or silently rewritten by this revision; they remain separate
+follow-up work if failures point there.
+
+### Local regression checks
+
+```sh
+sh clover-wifi-tools/test-clover-wifi-driver.sh
+sh clover-wifi-tools/test-clover-wifi-mac.sh
+git diff --check
+```
+
+Patch application, source checksums and compiler checks are necessary, but do
+not substitute for the hardware endurance and recovery tests above.
 
 ## Functional fixes
 
@@ -122,9 +225,9 @@ When PM660 reports no attached cable, the driver records the logical role as
 `role-switch-default-mode = "peripheral"`; this is the intended safe fallback
 and VBUS remains disabled.
 
-## Hardware validation
+## Baseline hardware validation (before r7)
 
-Final validation was performed on a Xiaomi Mi Pad 4 running:
+Baseline validation was performed on a Xiaomi Mi Pad 4 running:
 
 ```text
 6.19.10-sdm660 #5-aarch64

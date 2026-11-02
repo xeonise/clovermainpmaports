@@ -51,6 +51,8 @@ exit 0
 EOF
 cat >"$test_dir/bin/modprobe" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>"$TEST_ROOT/modprobe.log"
+[ "$*" != "${TEST_MODPROBE_FAIL:-}" ] || exit 1
 exit 0
 EOF
 cat >"$test_dir/bin/insmod" <<'EOF'
@@ -123,5 +125,28 @@ printf '%s\n' "$milestones" | grep -q '^firmware_faults_since_attempt=0$'
 printf 'WLAN RT: test assert\n' >>"$test_dir/dmesg"
 milestones=$(run_driver qcacld-milestones)
 printf '%s\n' "$milestones" | grep -q '^firmware_faults_since_attempt=1$'
+
+# Never proceed to ath10k if either part of the current stack fails to unload.
+for failure in '-r wlan' '-r qcom-icnss-clover'; do
+	: >"$test_dir/modprobe.log"
+	export TEST_MODPROBE_FAIL="$failure"
+	if run_driver use-ath10k; then
+		echo "unsafe ath10k rollback accepted after $failure failed" >&2
+		exit 1
+	fi
+	if grep -q '^ath10k_snoc$' "$test_dir/modprobe.log"; then
+		echo 'ath10k loaded despite unload failure' >&2
+		exit 1
+	fi
+done
+
+# Likewise, do not insert a candidate on top of a stack that did not unload.
+export TEST_MODPROBE_FAIL='-r wlan qcom-icnss-clover'
+if run_driver try-qcacld-modules \
+	"$test_dir/qcom-icnss-clover.ko" "$test_dir/wlan.ko"; then
+	echo 'candidate accepted after previous-stack unload failure' >&2
+	exit 1
+fi
+unset TEST_MODPROBE_FAIL
 
 printf 'clover-wifi-driver tests passed\n'

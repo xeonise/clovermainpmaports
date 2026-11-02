@@ -270,8 +270,14 @@ restore_ath10k_clean()
 		log "firmware fault detected; refusing an unsafe ath10k rollback"
 		return 1
 	fi
-	modprobe -r wlan 2>/dev/null || true
-	modprobe -r "$icnss_module" 2>/dev/null || true
+	modprobe -r wlan 2>/dev/null || {
+		log "could not unload wlan; refusing an unsafe ath10k rollback"
+		return 1
+	}
+	modprobe -r "$icnss_module" 2>/dev/null || {
+		log "could not unload ICNSS; refusing a dual-driver bind"
+		return 1
+	}
 	if fault_since "$baseline"; then
 		wait_for_remoteproc || true
 		log "firmware fault occurred during teardown; reboot required"
@@ -326,7 +332,10 @@ handoff_from_ath10k()
 {
 	baseline=$1
 	settle_seconds=${CLOVER_RECOVERY_SETTLE_SECONDS:-5}
-	modprobe -r wlan "$icnss_module" 2>/dev/null || true
+	modprobe -r wlan "$icnss_module" 2>/dev/null || {
+		log "could not unload the previous qcacld stack; reboot required"
+		return 1
+	}
 	modprobe -r ath10k_snoc ath10k_core 2>/dev/null || {
 		log "could not unload ath10k_snoc; refusing a dual-driver bind"
 		return 1

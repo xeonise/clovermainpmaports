@@ -1,0 +1,590 @@
+# Clover ICNSS: IRQ-safe lookup and serialized firmware lifecycle
+#
+# CE hard IRQs call icnss_get_ce_id(), so backend lookup must never take
+# a mutex. Pair acquire/release publication with client/IRQ teardown and
+# disable manual sysfs unbind while dependent clients can still call us.
+# Serialize client callbacks, firmware work and SSR against unregister.
+# Vote power before WLFW initialization, and never drop rails or reclaim
+# MSA underneath a probed client. Notify FW_DOWN before modem shutdown.
+# Require physical reserved MSA memory: a DMA-IOMMU IOVA is not an SCM PA.
+# Do not infer successful ownership transfer from an SCM -EINVAL error.
+# Keep the backend and QMI alive until client teardown is complete, and
+# avoid sleeping locks in noirq PM callbacks. Restore per-unit factory
+# MAC handling instead of embedding one tablet's address in shared DTS.
+#
+diff --git a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
+index af02c9da1..acf7dd322 100644
+--- a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
+@@ -775,7 +775,6 @@ &wifi {
+ 	vdd-1.3-rfa-supply = <&vreg_l6a_1p3>;
+ 	vdd-3.3-ch0-supply = <&vreg_l19a_3p3>;
+ 	vdd-3.3-ch1-supply = <&vreg_l19a_3p3>;
+-	local-mac-address = [d8 32 e3 06 a5 d7];
+ 
+ 	status = "okay";
+ };
+diff --git a/drivers/staging/qcom_icnss_clover/Kconfig b/drivers/staging/qcom_icnss_clover/Kconfig
+index 8fdfb51ea..5f6b2947c 100644
+--- a/drivers/staging/qcom_icnss_clover/Kconfig
++++ b/drivers/staging/qcom_icnss_clover/Kconfig
+@@ -3,6 +3,7 @@ config ICNSS
+ 	tristate "Qualcomm WCN3990 ICNSS backend for Clover qcacld"
+ 	depends on ARCH_QCOM
+ 	depends on NET
++	depends on QCOM_RPROC_COMMON
+ 	select QCOM_SCM
+ 	select QCOM_QMI_HELPERS
+ 	help
+diff --git a/drivers/staging/qcom_icnss_clover/icnss_clover.c b/drivers/staging/qcom_icnss_clover/icnss_clover.c
+index a7c1a1e25..481eb3b69 100644
+--- a/drivers/staging/qcom_icnss_clover/icnss_clover.c
++++ b/drivers/staging/qcom_icnss_clover/icnss_clover.c
+@@ -23,6 +23,7 @@
+ #include <linux/property.h>
+ #include <linux/qrtr.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/remoteproc/qcom_rproc.h>
+ #include <linux/slab.h>
+ #include <linux/soc/qcom/qmi.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+@@ -34,7 +35,6 @@
+ #define ICNSS_WLFW_CLIENT_ID		0x4b4e454c
+ #define ICNSS_WLFW_TIMEOUT		30
+ #define ICNSS_BDF_FILE			"ath10k/WCN3990/hw1.0/bdwlan.bin"
+-#define ICNSS_MSA_SIZE			0x100000
+ #define ICNSS_MAX_MEM_REGIONS		2
+ #define ICNSS_MAX_UNSAFE_CHANNELS	64
+ 
+@@ -67,6 +67,8 @@ struct icnss_ce_irq {
+ struct icnss_clover {
+ 	struct device *dev;
+ 	struct mutex lock;
++	/* Serializes client callbacks against unregister and modem SSR. */
++	struct mutex client_lock;
+ 	struct icnss_driver_ops *ops;
+ 
+ 	void __iomem *mem_base;
+@@ -102,6 +104,10 @@ struct icnss_clover {
+ 	struct icnss_driver_ops *active_ops;
+ 	bool driver_probed;
+ 	bool recovering;
++	bool fw_down_sent;
++
++	struct notifier_block ssr_nb;
++	void *ssr_cookie;
+ 	enum icnss_recovery_state recovery_state;
+ 	u32 recovery_generation;
+ 	int last_error;
+@@ -181,15 +187,17 @@ static const char * const icnss_clk_names[] = {
+ 	"qdss",
+ };
+ 
++/*
++ * qcacld calls icnss_get_ce_id() from its hard IRQ handler, so this lookup
++ * must not sleep.  icnss_global_lock only serializes probe and remove;
++ * remove clears the pointer after the client and all CE IRQs are gone.
++ */
+ static struct icnss_clover *icnss_from_dev(struct device *dev)
+ {
+-	struct icnss_clover *ic;
++	struct icnss_clover *ic = smp_load_acquire(&icnss_global);
+ 
+-	mutex_lock(&icnss_global_lock);
+-	ic = icnss_global;
+ 	if (ic && dev && dev != ic->dev)
+ 		ic = NULL;
+-	mutex_unlock(&icnss_global_lock);
+ 
+ 	return ic;
+ }
+@@ -258,6 +266,29 @@ static int icnss_hw_power_off(struct icnss_clover *ic)
+ 	return ret;
+ }
+ 
++/*
++ * WLFW bring-up and failure paths drop the rails, but a probed qcacld may
++ * still be touching CE registers; only ops->remove/shutdown may cut them.
++ */
++static void icnss_hw_power_off_unprobed(struct icnss_clover *ic)
++{
++	bool probed;
++
++	mutex_lock(&ic->lock);
++	probed = ic->driver_probed;
++	mutex_unlock(&ic->lock);
++	if (!probed)
++		icnss_hw_power_off(ic);
++}
++
++static void icnss_cancel_works(struct icnss_clover *ic)
++{
++	cancel_work_sync(&ic->server_work);
++	cancel_work_sync(&ic->bdf_work);
++	cancel_work_sync(&ic->fw_ready_work);
++	cancel_work_sync(&ic->server_exit_work);
++}
++
+ static int icnss_assign_one_region(struct icnss_clover *ic,
+ 				   struct icnss_mem_region *region)
+ {
+@@ -561,16 +592,12 @@ static int icnss_qmi_msa_info(struct icnss_clover *ic)
+ 	if (reclaim_adopted) {
+ 		for (i = 0; i < resp.mem_region_info_len; i++) {
+ 			ret = icnss_unassign_one_region(ic, &ic->mem_region[i]);
+-			if (ret && ret != -EINVAL) {
++			if (ret) {
+ 				dev_err(ic->dev,
+ 					"failed to reclaim inherited MSA region %d: %d\n",
+ 					i, ret);
+ 				return ret;
+ 			}
+-			if (ret == -EINVAL)
+-				dev_info(ic->dev,
+-					 "inherited MSA region %d was already HLOS-owned\n",
+-					 i);
+ 			mutex_lock(&ic->lock);
+ 			ic->mem_region[i].owner = ICNSS_MSA_OWNER_HLOS;
+ 			mutex_unlock(&ic->lock);
+@@ -750,6 +777,10 @@ static void icnss_bdf_work(struct work_struct *work)
+ 	const struct firmware *fw;
+ 	int ret;
+ 
++	guard(mutex)(&ic->client_lock);
++	if (READ_ONCE(ic->removing))
++		return;
++
+ 	ret = request_firmware(&fw, ICNSS_BDF_FILE, ic->dev);
+ 	if (ret) {
+ 		dev_err(ic->dev, "failed to load %s: %d\n", ICNSS_BDF_FILE, ret);
+@@ -766,7 +797,7 @@ static void icnss_bdf_work(struct work_struct *work)
+ 	return;
+ 
+ failed:
+-	icnss_hw_power_off(ic);
++	icnss_hw_power_off_unprobed(ic);
+ 	icnss_set_failed(ic, ret);
+ }
+ 
+@@ -898,6 +929,7 @@ static void icnss_call_fw_ready(struct icnss_clover *ic)
+ 	bool reinit;
+ 	int ret = 0;
+ 
++	guard(mutex)(&ic->client_lock);
+ 	mutex_lock(&ic->lock);
+ 	if (ic->removing || !ic->qmi_connected) {
+ 		mutex_unlock(&ic->lock);
+@@ -930,6 +962,7 @@ static void icnss_call_fw_ready(struct icnss_clover *ic)
+ 		ic->active_ops = ops;
+ 		ic->driver_probed = true;
+ 		ic->recovering = false;
++		ic->fw_down_sent = false;
+ 		ic->recovery_state = ICNSS_RECOVERY_READY;
+ 		ic->last_error = 0;
+ 		mutex_unlock(&ic->lock);
+@@ -937,7 +970,7 @@ static void icnss_call_fw_ready(struct icnss_clover *ic)
+ 			ops->uevent(ic->dev, &event);
+ 		return;
+ 	}
+-	icnss_hw_power_off(ic);
++	icnss_hw_power_off_unprobed(ic);
+ failed:
+ 	icnss_set_failed(ic, ret);
+ 	dev_err(ic->dev, "qcacld ready callback failed: %d\n", ret);
+@@ -962,15 +995,18 @@ static void icnss_server_exit_work(struct work_struct *work)
+ 	};
+ 	struct icnss_driver_ops *ops;
+ 
++	guard(mutex)(&ic->client_lock);
++	if (READ_ONCE(ic->removing))
++		return;
++
+ 	mutex_lock(&ic->lock);
+ 	dev_info(ic->dev,
+ 		 "WLFW service exit work in state %s (connected=%u)\n",
+ 		 icnss_recovery_state_name(ic->recovery_state),
+ 		 ic->qmi_connected);
+-	ic->qmi_connected = false;
+-	ic->fw_ready = false;
+-	ic->msa_ready = false;
+-	ops = ic->active_ops;
++	/* The SSR notifier may already have reported this firmware down. */
++	ops = ic->fw_down_sent ? NULL : ic->active_ops;
++	ic->fw_down_sent = true;
+ 	if (ic->driver_probed) {
+ 		ic->recovering = true;
+ 		icnss_begin_recovery_locked(ic);
+@@ -982,6 +1018,45 @@ static void icnss_server_exit_work(struct work_struct *work)
+ 		ops->uevent(ic->dev, &event);
+ }
+ 
++/*
++ * WLFW runs on the modem.  WLFW del_server only arrives after the modem is
++ * already being stopped, and qcacld keeps touching CE registers until it
++ * sees FW_DOWN.  Report it from the modem SSR notifier before shutdown so
++ * qcacld stops register access while WCSS is still clocked.
++ */
++static int icnss_ssr_notify(struct notifier_block *nb, unsigned long action,
++			    void *data)
++{
++	struct icnss_clover *ic =
++		container_of(nb, struct icnss_clover, ssr_nb);
++	const struct qcom_ssr_notify_data *notify = data;
++	struct icnss_uevent_fw_down_data down = {
++		.crashed = notify && notify->crashed,
++	};
++	struct icnss_uevent_data event = {
++		.uevent = ICNSS_UEVENT_FW_DOWN,
++		.data = &down,
++	};
++	struct icnss_driver_ops *ops = NULL;
++
++	if (action != QCOM_SSR_BEFORE_SHUTDOWN)
++		return NOTIFY_DONE;
++
++	guard(mutex)(&ic->client_lock);
++	mutex_lock(&ic->lock);
++	if (!ic->removing && ic->driver_probed && !ic->fw_down_sent) {
++		ops = ic->active_ops;
++		ic->fw_down_sent = true;
++	}
++	mutex_unlock(&ic->lock);
++	if (ops && ops->uevent) {
++		dev_info(ic->dev, "modem shutting down, reporting WLFW down\n");
++		ops->uevent(ic->dev, &event);
++	}
++
++	return NOTIFY_OK;
++}
++
+ static void icnss_server_work(struct work_struct *work)
+ {
+ 	struct icnss_clover *ic =
+@@ -992,6 +1067,15 @@ static void icnss_server_work(struct work_struct *work)
+ 	bool ready;
+ 	int ret;
+ 
++	guard(mutex)(&ic->client_lock);
++	if (READ_ONCE(ic->removing))
++		return;
++	/* Take our own rail votes before any WLFW initialization. */
++	stage = "power-on";
++	ret = icnss_hw_power_on(ic);
++	if (ret)
++		goto failed;
++	stage = "ind-register";
+ 	ret = icnss_qmi_ind_register(ic);
+ 	if (ret)
+ 		goto fail_power;
+@@ -1083,7 +1167,7 @@ static void icnss_server_work(struct work_struct *work)
+ 			queue_work(ic->wq, &ic->bdf_work);
+ 		return;
+ 	}
+-	icnss_hw_power_off(ic);
++	icnss_hw_power_off_unprobed(ic);
+ 	if (ready) {
+ 		/* Publish protocol readiness before deferred qcacld callbacks. */
+ 		mutex_lock(&ic->lock);
+@@ -1099,11 +1183,12 @@ static void icnss_server_work(struct work_struct *work)
+ 	return;
+ 
+ fail_msa:
+-	if (assigned_here)
++	/* Do not revoke memory underneath a still-probed recovering client. */
++	if (assigned_here && !READ_ONCE(ic->driver_probed))
+ 		icnss_unassign_msa(ic);
+ fail_power:
+-	icnss_hw_power_off(ic);
+-fail:
++	icnss_hw_power_off_unprobed(ic);
++failed:
+ 	icnss_set_failed(ic, ret);
+ 	dev_err(ic->dev, "WLFW initialization failed at %s: %d\n",
+ 		stage, ret);
+@@ -1116,7 +1201,8 @@ static void icnss_qmi_fw_ready_ind(struct qmi_handle *qmi,
+ 	struct icnss_clover *ic =
+ 		container_of(qmi, struct icnss_clover, qmi);
+ 
+-	queue_work(ic->wq, &ic->fw_ready_work);
++	if (!READ_ONCE(ic->removing))
++		queue_work(ic->wq, &ic->fw_ready_work);
+ }
+ 
+ static void icnss_qmi_msa_ready_ind(struct qmi_handle *qmi,
+@@ -1125,11 +1211,14 @@ static void icnss_qmi_msa_ready_ind(struct qmi_handle *qmi,
+ {
+ 	struct icnss_clover *ic =
+ 		container_of(qmi, struct icnss_clover, qmi);
++	bool removing;
+ 
+ 	mutex_lock(&ic->lock);
+ 	ic->msa_ready = true;
++	removing = ic->removing;
+ 	mutex_unlock(&ic->lock);
+-	queue_work(ic->wq, &ic->bdf_work);
++	if (!removing)
++		queue_work(ic->wq, &ic->bdf_work);
+ }
+ 
+ static const struct qmi_msg_handler icnss_qmi_handlers[] = {
+@@ -1157,6 +1246,17 @@ static int icnss_qmi_new_server(struct qmi_handle *qmi,
+ 		container_of(qmi, struct icnss_clover, qmi);
+ 	int ret;
+ 
++	mutex_lock(&ic->lock);
++	if (ic->removing ||
++	    (ic->qmi_connected && !ic->fw_down_sent &&
++	     ic->recovery_state == ICNSS_RECOVERY_READY &&
++	     ic->sq.sq_node == service->node &&
++	     ic->sq.sq_port == service->port)) {
++		mutex_unlock(&ic->lock);
++		return 0;
++	}
++	mutex_unlock(&ic->lock);
++
+ 	ic->sq.sq_family = AF_QIPCRTR;
+ 	ic->sq.sq_node = service->node;
+ 	ic->sq.sq_port = service->port;
+@@ -1165,6 +1265,10 @@ static int icnss_qmi_new_server(struct qmi_handle *qmi,
+ 	if (ret)
+ 		return ret;
+ 	mutex_lock(&ic->lock);
++	if (ic->removing) {
++		mutex_unlock(&ic->lock);
++		return 0;
++	}
+ 	dev_info(ic->dev,
+ 		 "WLFW service arrival in state %s (connected=%u busy=%u)\n",
+ 		 icnss_recovery_state_name(ic->recovery_state),
+@@ -1187,8 +1291,19 @@ static void icnss_qmi_del_server(struct qmi_handle *qmi,
+ 	struct icnss_clover *ic =
+ 		container_of(qmi, struct icnss_clover, qmi);
+ 
++	mutex_lock(&ic->lock);
++	/* A delayed deletion for an old service must not tear down a new one. */
++	if (ic->sq.sq_node != service->node ||
++	    ic->sq.sq_port != service->port) {
++		mutex_unlock(&ic->lock);
++		return;
++	}
++	ic->qmi_connected = false;
++	ic->fw_ready = false;
++	ic->msa_ready = false;
+ 	if (!ic->removing)
+ 		queue_work(ic->wq, &ic->server_exit_work);
++	mutex_unlock(&ic->lock);
+ }
+ 
+ static const struct qmi_ops icnss_qmi_ops = {
+@@ -1206,16 +1321,26 @@ int __icnss_register_driver(struct icnss_driver_ops *ops,
+ 		return -EPROBE_DEFER;
+ 	if (!ops || !ops->probe || !owner || !mod_name)
+ 		return -EINVAL;
++	mutex_lock(&ic->client_lock);
+ 	mutex_lock(&ic->lock);
+-	if (ic->ops) {
++	if (ic->ops || ic->removing) {
+ 		mutex_unlock(&ic->lock);
++		mutex_unlock(&ic->client_lock);
+ 		return -EBUSY;
+ 	}
+ 	ic->ops = ops;
+ 	ready = ic->fw_ready;
+ 	mutex_unlock(&ic->lock);
+-	if (ready)
+-		icnss_call_fw_ready(ic);
++	mutex_unlock(&ic->client_lock);
++	/*
++	 * Probe on the ordered workqueue so it cannot race a queued
++	 * fw_ready_work into a second ops->probe; wait to keep registration
++	 * synchronous for qcacld.
++	 */
++	if (ready) {
++		queue_work(ic->wq, &ic->fw_ready_work);
++		flush_work(&ic->fw_ready_work);
++	}
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(__icnss_register_driver);
+@@ -1227,6 +1352,7 @@ int icnss_unregister_driver(struct icnss_driver_ops *ops)
+ 
+ 	if (!ic)
+ 		return -ENODEV;
++	guard(mutex)(&ic->client_lock);
+ 	mutex_lock(&ic->lock);
+ 	if (ic->ops != ops) {
+ 		mutex_unlock(&ic->lock);
+@@ -1235,13 +1361,16 @@ int icnss_unregister_driver(struct icnss_driver_ops *ops)
+ 	remove = ic->driver_probed;
+ 	ic->ops = NULL;
+ 	ic->active_ops = NULL;
++	mutex_unlock(&ic->lock);
++	if (remove && ops->remove)
++		ops->remove(ic->dev);
++	mutex_lock(&ic->lock);
+ 	ic->driver_probed = false;
+ 	ic->recovering = false;
++	ic->fw_down_sent = false;
+ 	ic->recovery_state = ic->fw_ready ? ICNSS_RECOVERY_FW_READY :
+ 		ICNSS_RECOVERY_INACTIVE;
+ 	mutex_unlock(&ic->lock);
+-	if (remove && ops->remove)
+-		ops->remove(ic->dev);
+ 	icnss_hw_power_off(ic);
+ 	return 0;
+ }
+@@ -1350,7 +1479,7 @@ void icnss_disable_irq(struct device *dev, unsigned int ce_id)
+ 	struct icnss_clover *ic = icnss_from_dev(dev);
+ 
+ 	if (ic && ce_id < ARRAY_SIZE(ic->ce))
+-		disable_irq(ic->ce[ce_id].irq);
++		disable_irq_nosync(ic->ce[ce_id].irq);
+ }
+ EXPORT_SYMBOL_GPL(icnss_disable_irq);
+ 
+@@ -1825,6 +1954,7 @@ static int icnss_clover_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	ic->dev = dev;
+ 	mutex_init(&ic->lock);
++	mutex_init(&ic->client_lock);
+ 	platform_set_drvdata(pdev, ic);
+ 
+ 	/*
+@@ -1861,20 +1991,14 @@ static int icnss_clover_probe(struct platform_device *pdev)
+ 		return ret;
+ 
+ 	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &r);
+-	if (!ret) {
+-		ic->msa_pa = r.start;
+-		ic->msa_size = resource_size(&r);
+-		ic->msa_va = devm_memremap(dev, r.start, resource_size(&r),
+-					   MEMREMAP_WT);
+-		if (IS_ERR(ic->msa_va))
+-			return PTR_ERR(ic->msa_va);
+-	} else {
+-		ic->msa_size = ICNSS_MSA_SIZE;
+-		ic->msa_va = dmam_alloc_coherent(dev, ic->msa_size,
+-						 &ic->msa_pa, GFP_KERNEL);
+-		if (!ic->msa_va)
+-			return -ENOMEM;
+-	}
++	/* SCM needs a physical carveout address, not a DMA-IOMMU IOVA. */
++	if (ret)
++		return dev_err_probe(dev, ret, "missing reserved MSA memory\n");
++	ic->msa_pa = r.start;
++	ic->msa_size = resource_size(&r);
++	ic->msa_va = devm_memremap(dev, r.start, resource_size(&r), MEMREMAP_WT);
++	if (IS_ERR(ic->msa_va))
++		return PTR_ERR(ic->msa_va);
+ 	ic->msa_fixed_perm =
+ 		device_property_read_bool(dev, "qcom,msa-fixed-perm");
+ 	device_get_mac_address(dev, (char *)ic->mac_addr);
+@@ -1896,21 +2020,34 @@ static int icnss_clover_probe(struct platform_device *pdev)
+ 			     WLFW_SERVICE_VERS_V01, 0);
+ 	if (ret)
+ 		goto err_qmi;
++	ic->ssr_nb.notifier_call = icnss_ssr_notify;
++	ic->ssr_cookie = qcom_register_ssr_notifier("mpss", &ic->ssr_nb);
++	if (IS_ERR(ic->ssr_cookie)) {
++		ret = PTR_ERR(ic->ssr_cookie);
++		goto err_qmi;
++	}
+ 
+ 	mutex_lock(&icnss_global_lock);
+ 	if (icnss_global) {
+ 		mutex_unlock(&icnss_global_lock);
+ 		ret = -EBUSY;
+-		goto err_qmi;
++		goto err_ssr;
+ 	}
+-	icnss_global = ic;
++	/* Publish a fully initialized backend to lockless readers. */
++	smp_store_release(&icnss_global, ic);
+ 	mutex_unlock(&icnss_global_lock);
+ 	dev_info(dev, "WCN3990 ICNSS/WLFW backend registered\n");
+ 	return 0;
+ 
++err_ssr:
++	qcom_unregister_ssr_notifier(ic->ssr_cookie, &ic->ssr_nb);
+ err_qmi:
++	WRITE_ONCE(ic->removing, true);
++	icnss_cancel_works(ic);
+ 	qmi_handle_release(&ic->qmi);
+ 	ic->qmi_initialized = false;
++	icnss_cancel_works(ic);
++	icnss_hw_power_off(ic);
+ err_wq:
+ 	destroy_workqueue(ic->wq);
+ 	return ret;
+@@ -1924,21 +2061,29 @@ static void icnss_clover_remove(struct platform_device *pdev)
+ 	mutex_lock(&ic->lock);
+ 	ic->removing = true;
+ 	mutex_unlock(&ic->lock);
+-	mutex_lock(&icnss_global_lock);
+-	if (icnss_global == ic)
+-		icnss_global = NULL;
+-	mutex_unlock(&icnss_global_lock);
+-	if (ic->qmi_initialized)
+-		qmi_handle_release(&ic->qmi);
+-	cancel_work_sync(&ic->server_work);
+-	cancel_work_sync(&ic->bdf_work);
+-	cancel_work_sync(&ic->fw_ready_work);
+-	cancel_work_sync(&ic->server_exit_work);
++	qcom_unregister_ssr_notifier(ic->ssr_cookie, &ic->ssr_nb);
++	/*
++	 * Works use ic->qmi, and the client tears down through icnss_*
++	 * exports, so both must finish before QMI or icnss_global go away.
++	 */
++	icnss_cancel_works(ic);
++	mutex_lock(&ic->client_lock);
+ 	if (ic->driver_probed && ic->active_ops && ic->active_ops->remove)
+ 		ic->active_ops->remove(ic->dev);
++	ic->active_ops = NULL;
++	ic->driver_probed = false;
++	mutex_unlock(&ic->client_lock);
+ 	for (i = 0; i < ARRAY_SIZE(ic->ce); i++)
+ 		if (ic->ce[i].requested)
+ 			free_irq(ic->ce[i].irq, ic->ce[i].ctx);
++	if (ic->qmi_initialized)
++		qmi_handle_release(&ic->qmi);
++	/* QMI callbacks are stopped now; drop anything they queued. */
++	icnss_cancel_works(ic);
++	mutex_lock(&icnss_global_lock);
++	if (icnss_global == ic)
++		WRITE_ONCE(icnss_global, NULL);
++	mutex_unlock(&icnss_global_lock);
+ 	icnss_unassign_msa(ic);
+ 	icnss_hw_power_off(ic);
+ 	kfree(ic->dfs_nol);
+@@ -1985,9 +2130,8 @@ static int icnss_clover_pm_suspend_noirq(struct device *dev)
+ 	struct icnss_clover *ic = dev_get_drvdata(dev);
+ 	struct icnss_driver_ops *ops;
+ 
+-	mutex_lock(&ic->lock);
+-	ops = ic->driver_probed ? ic->active_ops : NULL;
+-	mutex_unlock(&ic->lock);
++	/* The PM core pins the device; no sleeping locks with IRQs disabled. */
++	ops = READ_ONCE(ic->active_ops);
+ 	return ops && ops->suspend_noirq ? ops->suspend_noirq(dev) : 0;
+ }
+ 
+@@ -1996,9 +2140,7 @@ static int icnss_clover_pm_resume_noirq(struct device *dev)
+ 	struct icnss_clover *ic = dev_get_drvdata(dev);
+ 	struct icnss_driver_ops *ops;
+ 
+-	mutex_lock(&ic->lock);
+-	ops = ic->driver_probed ? ic->active_ops : NULL;
+-	mutex_unlock(&ic->lock);
++	ops = READ_ONCE(ic->active_ops);
+ 	return ops && ops->resume_noirq ? ops->resume_noirq(dev) : 0;
+ }
+ 
+@@ -2020,6 +2162,8 @@ static struct platform_driver icnss_clover_driver = {
+ 	.shutdown = icnss_clover_shutdown,
+ 	.driver = {
+ 		.name = "icnss-clover",
++		/* Client exports pin this module, but not a manual sysfs unbind. */
++		.suppress_bind_attrs = true,
+ 		.of_match_table = icnss_clover_of_match,
+ 		.pm = &icnss_clover_pm_ops,
+ 		.dev_groups = icnss_clover_groups,

@@ -1,19 +1,8 @@
 #!/bin/sh
 
-IFACE="$1"
-ACTION="$2"
-
-[ "$IFACE" = "wlan0" ] || exit 0
-[ "$ACTION" = "down" ] || exit 0
-[ -e /run/xiaomi-clover-wlan-reset.lock ] && exit 0
-
-(
-	touch /run/xiaomi-clover-wlan-reset.lock
-	sleep 1
-	ip link set wlan0 down || true
-	sleep 2
-	ip link set wlan0 up || true
-	rm -f /run/xiaomi-clover-wlan-reset.lock
-) >/run/xiaomi-clover-wlan-reset.log 2>&1 &
-
+# Retained as a no-op so package upgrades replace the old dispatcher.
+# A "down" event can be intentional (rfkill, suspend, driver handoff).
+# Forcing wlan0 back up here races NetworkManager and can reset the target
+# during teardown. Firmware recovery belongs to ICNSS/qcacld, not a shell
+# job that survives the NetworkManager dispatcher.
 exit 0

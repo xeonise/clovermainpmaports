@@ -6,6 +6,12 @@ QCACLD 5.2 driver with WCN3990, while OTG uses PM660 Type-C role detection and
 VBUS control. The repository is based on the upstream postmarketOS pmaports
 tree.
 
+Kernel `6.19.10-r7` / device `11-r4` add freeze hardening (IRQ-safe ICNSS
+lookups, serialized recovery/teardown, BSSID statistics and quieter logging).
+These changes require new cold-boot and endurance validation; the previous
+hardware results apply to the r6 baseline. See `clover-wifi-notes/FIX.MD`
+for deployment checks and the separate, still-unvalidated hardware watchdog.
+
 The main source changes are in:
 
 - `device/testing/linux-postmarketos-qcom-sdm660/` — ICNSS integration and the

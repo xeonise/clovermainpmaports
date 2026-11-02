@@ -3,6 +3,7 @@ set -eu
 
 PERSIST=${PERSIST:-/run/msm-firmware-loader/mnt/persist}
 IFACE=${IFACE:-wlan0}
+SYSFS_NET=${SYSFS_NET:-/sys/class/net}
 
 log() {
 	echo "$@" | logger -t "xiaomi-clover-wifi-mac"
@@ -75,14 +76,17 @@ while ! mac=$(read_mac); do
 	timeout=$((timeout + 1))
 done
 
-current=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || true)
+current=$(cat "$SYSFS_NET/$IFACE/address" 2>/dev/null || true)
 if [ "$current" = "$mac" ]; then
 	log "$IFACE already uses factory MAC $mac"
 	exit 0
 fi
 
 was_up=0
-if ip link show dev "$IFACE" | grep -q "state UP"; then
+# Operational state is DOWN while unassociated even when IFF_UP is set.
+# Preserve the administrative flag, not the presence of carrier.
+flags=$(cat "$SYSFS_NET/$IFACE/flags")
+if [ $((flags & 1)) -ne 0 ]; then
 	was_up=1
 fi
 

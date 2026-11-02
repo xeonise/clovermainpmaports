@@ -1,0 +1,181 @@
+# qcacld: safer production assertions, CE access and compiler checks
+#
+# Allocator debug support must not silently turn vendor assertions into
+# BUG(). Check target availability before IRQ/tasklet CE MMIO, including
+# the register write that disables a CE interrupt. Keep pointer-type
+# errors fatal, fix read-only netdev MAC uses, and add void prototypes
+# accepted by current clang. The adapter MAC tracks netdev dev_addr.
+#
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_service.c b/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_service.c
+index 0fee1bf0f..38cfec46e 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_service.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_service.c
+@@ -2739,7 +2739,7 @@ struct ce_ops ce_service_legacy = {
+ };
+ 
+ 
+-struct ce_ops *ce_services_legacy()
++struct ce_ops *ce_services_legacy(void)
+ {
+ 	return &ce_service_legacy;
+ }
+diff --git a/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_tasklet.c b/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_tasklet.c
+index 8ac93bfe0..b678175a5 100644
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_tasklet.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/ce/ce_tasklet.c
+@@ -152,6 +152,12 @@ static void ce_tasklet(unsigned long data)
+ 	struct hif_softc *scn = HIF_GET_SOFTC(hif_ce_state);
+ 	struct CE_state *CE_state = scn->ce_id_to_state[tasklet_entry->ce_id];
+ 
++	/* An already-scheduled tasklet can run after the modem FW_DOWN event. */
++	if (!TARGET_REGISTER_ACCESS_ALLOWED(scn)) {
++		qdf_atomic_dec(&scn->active_tasklet_cnt);
++		return;
++	}
++
+ 	hif_record_ce_desc_event(scn, tasklet_entry->ce_id,
+ 			HIF_CE_TASKLET_ENTRY, NULL, NULL, 0, 0);
+ 
+@@ -385,11 +391,12 @@ irqreturn_t ce_dispatch_interrupt(int ce_id,
+ 		return IRQ_NONE;
+ 	}
+ 
+-	hif_irq_disable(scn, ce_id);
+-
++	/* hif_irq_disable writes CE MMIO too; test before the first access. */
+ 	if (!TARGET_REGISTER_ACCESS_ALLOWED(scn))
+ 		return IRQ_HANDLED;
+ 
++	hif_irq_disable(scn, ce_id);
++
+ 	hif_record_ce_desc_event(scn, ce_id, HIF_IRQ_EVENT,
+ 				NULL, NULL, 0, 0);
+ 	hif_ce_increment_interrupt_count(hif_ce_state, ce_id);
+diff --git a/drivers/staging/qca-wifi-host-cmn/target_if/core/src/target_if_main.c b/drivers/staging/qca-wifi-host-cmn/target_if/core/src/target_if_main.c
+index b17f664f9..d4a35decb 100644
+--- a/drivers/staging/qca-wifi-host-cmn/target_if/core/src/target_if_main.c
++++ b/drivers/staging/qca-wifi-host-cmn/target_if/core/src/target_if_main.c
+@@ -78,7 +78,7 @@
+ 
+ static struct target_if_ctx *g_target_if_ctx;
+ 
+-struct target_if_ctx *target_if_get_ctx()
++struct target_if_ctx *target_if_get_ctx(void)
+ {
+ 	return g_target_if_ctx;
+ }
+diff --git a/drivers/staging/qca-wifi-host-cmn/wlan_cfg/wlan_cfg.c b/drivers/staging/qca-wifi-host-cmn/wlan_cfg/wlan_cfg.c
+index 6aa77c3b4..62bdb253c 100644
+--- a/drivers/staging/qca-wifi-host-cmn/wlan_cfg/wlan_cfg.c
++++ b/drivers/staging/qca-wifi-host-cmn/wlan_cfg/wlan_cfg.c
+@@ -289,7 +289,7 @@ struct wlan_cfg_dp_pdev_ctxt {
+  *
+  * Return: wlan_cfg_ctx - Handle to Configuration context
+  */
+-struct wlan_cfg_dp_soc_ctxt *wlan_cfg_soc_attach()
++struct wlan_cfg_dp_soc_ctxt *wlan_cfg_soc_attach(void)
+ {
+ 	int i = 0;
+ 
+diff --git a/drivers/staging/qcacld-3.0/Kbuild b/drivers/staging/qcacld-3.0/Kbuild
+index 33c83d049..f73b88413 100644
+--- a/drivers/staging/qcacld-3.0/Kbuild
++++ b/drivers/staging/qcacld-3.0/Kbuild
+@@ -1587,6 +1587,7 @@ ccflags-y += $(INCS)
+ cppflags-y +=	-DANI_OS_TYPE_ANDROID=6 \
+ 		-Wall\
+ 		-Wno-error\
++		-Werror=incompatible-pointer-types\
+ 		-D__linux__
+ 
+ cppflags-$(CONFIG_PTT_SOCK_SVC_ENABLE) += -DPTT_SOCK_SVC_ENABLE
+diff --git a/drivers/staging/qcacld-3.0/configs/default_defconfig b/drivers/staging/qcacld-3.0/configs/default_defconfig
+index 48f6f3b1b..037826607 100644
+--- a/drivers/staging/qcacld-3.0/configs/default_defconfig
++++ b/drivers/staging/qcacld-3.0/configs/default_defconfig
+@@ -351,16 +351,10 @@ BUILD_DEBUG_VERSION := y
+ #Enable this flag to build driver in diag version
+ BUILD_DIAG_VERSION := y
+ 
+-ifeq ($(CONFIG_SLUB_DEBUG), y)
+-	PANIC_ON_BUG := y
+-	WLAN_WARN_ON_ASSERT := y
+-else ifeq ($(CONFIG_PERF_DEBUG), y)
+-	PANIC_ON_BUG := y
+-	WLAN_WARN_ON_ASSERT := y
+-else
+-	PANIC_ON_BUG := n
+-	WLAN_WARN_ON_ASSERT := n
+-endif
++# SLUB_DEBUG only makes allocator diagnostics available; it must not turn
++# vendor assertions into BUG()s that kill a lock-owning driver thread.
++PANIC_ON_BUG := n
++WLAN_WARN_ON_ASSERT := n
+ 
+ # Compile all log levels by default
+ CONFIG_WLAN_LOG_FATAL := y
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h
+index d96b376b4..44fd0a9a6 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h
++++ b/drivers/staging/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h
+@@ -2204,7 +2204,7 @@ QDF_STATUS hdd_start_all_adapters(struct hdd_context *hdd_ctx);
+ struct hdd_adapter *hdd_get_adapter_by_vdev(struct hdd_context *hdd_ctx,
+ 				       uint32_t vdev_id);
+ struct hdd_adapter *hdd_get_adapter_by_macaddr(struct hdd_context *hdd_ctx,
+-					  tSirMacAddr macAddr);
++					  const uint8_t *macAddr);
+ 
+ /*
+  * hdd_get_adapter_by_rand_macaddr() - find Random mac adapter
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
+index 01d139f61..540e412e8 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_hostapd.c
+@@ -1854,7 +1854,7 @@ QDF_STATUS hdd_hostapd_sap_event_cb(tpSap_Event pSapEvent,
+ 						   ap_ctx->broadcast_sta_id,
+ 						   adapter->session_id,
+ 						   WLAN_IPA_AP_CONNECT,
+-						   adapter->dev->dev_addr);
++						   adapter->mac_addr.bytes);
+ 			if (status)
+ 				hdd_err("WLAN_AP_CONNECT event failed");
+ 		}
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+index ad156c081..a524c680e 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -7107,7 +7107,7 @@ struct hdd_adapter *hdd_get_adapter_by_rand_macaddr(
+ }
+ 
+ struct hdd_adapter *hdd_get_adapter_by_macaddr(struct hdd_context *hdd_ctx,
+-					  tSirMacAddr macAddr)
++					  const uint8_t *macAddr)
+ {
+ 	struct hdd_adapter *adapter;
+ 
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c
+index 0181511c7..fd752820a 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_softap_tx_rx.c
+@@ -1258,7 +1258,7 @@ QDF_STATUS hdd_softap_stop_bss(struct hdd_adapter *adapter)
+ 				      ap_ctx->broadcast_sta_id,
+ 				      adapter->session_id,
+ 				      WLAN_IPA_AP_DISCONNECT,
+-				      adapter->dev->dev_addr) !=
++				      adapter->mac_addr.bytes) !=
+ 		    QDF_STATUS_SUCCESS)
+ 			hdd_err("WLAN_AP_DISCONNECT event failed");
+ 	}
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wext.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wext.c
+index 69566634c..0e3ada8aa 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wext.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_wext.c
+@@ -8530,7 +8530,7 @@ static int __iw_set_pno(struct net_device *dev,
+ 		return ret;
+ 
+ 	vdev = wlan_objmgr_get_vdev_by_macaddr_from_pdev(hdd_ctx->pdev,
+-							 dev->dev_addr,
++							 adapter->mac_addr.bytes,
+ 							 WLAN_LEGACY_MAC_ID);
+ 	if (!vdev) {
+ 		hdd_err("vdev object is NULL");

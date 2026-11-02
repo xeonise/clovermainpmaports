@@ -1,0 +1,39 @@
+# qcacld: report the AP from dump_station in station mode
+#
+# NetworkManager dumps station statistics periodically. Returning our own
+# interface MAC makes RCPI validation fail on every poll. Return the
+# associated BSSID for STA/P2P clients, and no entry when disconnected.
+#
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_stats.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_stats.c
+index b975446e5..90de0dd2e 100644
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_stats.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_stats.c
+@@ -4656,10 +4656,27 @@ static int __wlan_hdd_cfg80211_dump_station(struct wiphy *wiphy,
+ 				int idx, u8 *mac,
+ 				struct station_info *sinfo)
+ {
++	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
++	struct hdd_station_ctx *sta_ctx;
++
+ 	hdd_debug("%s: idx %d", __func__, idx);
+ 	if (idx != 0)
+ 		return -ENOENT;
+-	qdf_mem_copy(mac, dev->dev_addr, QDF_MAC_ADDR_SIZE);
++	/*
++	 * A station's only peer is its AP.  Reporting the interface's own
++	 * address makes NetworkManager poll get_station with a non-BSSID MAC,
++	 * which fails the RCPI check on every poll.
++	 */
++	if (adapter->device_mode == QDF_STA_MODE ||
++	    adapter->device_mode == QDF_P2P_CLIENT_MODE) {
++		sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
++		if (sta_ctx->conn_info.connState != eConnectionState_Associated)
++			return -ENOENT;
++		qdf_mem_copy(mac, sta_ctx->conn_info.bssId.bytes,
++			     QDF_MAC_ADDR_SIZE);
++	} else {
++		qdf_mem_copy(mac, dev->dev_addr, QDF_MAC_ADDR_SIZE);
++	}
+ 	return __wlan_hdd_cfg80211_get_station(wiphy, dev, mac, sinfo);
+ }
+ 
